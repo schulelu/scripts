@@ -17,6 +17,14 @@ TEMPLATE_MARKER=".kvm-template"
 KVM_SSH_KEY="" # Set dynamically in main() via get_kvm_ssh_key_path
 CLOUD_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 
+# --- Anti-Detection Hardware Profiles ---
+# Format: manufacturer|product|bios_vendor|bios_version|mac_oui
+STEALTH_PROFILES=(
+    "Dell Inc.|OptiPlex 7090|Dell Inc.|2.20.0|D0:94:66"
+    "Lenovo|ThinkCentre M920q|Lenovo|M22KT55A|70:5A:0F"
+    "HP|ProDesk 400 G7|HP|S17 Ver. 02.05.00|3C:52:82"
+)
+
 # --- Color Output ---
 RED=""
 GREEN=""
@@ -88,6 +96,16 @@ function confirm() {
     echo -n "${YELLOW}${prompt} [y/N]${RESET} "
     read -r answer
     [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+function generate_serial() {
+    head -c 100 /dev/urandom | tr -dc 'A-Z0-9' | head -c 7
+}
+
+function generate_mac() {
+    local oui_prefix="$1"
+    printf '%s:%02X:%02X:%02X' "$oui_prefix" \
+        $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256))
 }
 
 function require_deps() {
@@ -300,13 +318,14 @@ function cmd_create() {
         die "VM '$name' already exists"
     fi
 
-    local template="" iso="" cloud_image=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
+    local template="" iso="" cloud_image=false stealth=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --template)    template="$2"; shift 2 ;;
             --iso)         iso="$2"; shift 2 ;;
             --cloud-image) cloud_image=true; shift ;;
+            --stealth)     stealth=true; shift ;;
             --cpu)         cpu="$2"; shift 2 ;;
             --ram)         ram_mib=$(parse_ram_to_mib "$2"); shift 2 ;;
             --disk)        disk_gb=$(parse_disk_to_gb "$2"); shift 2 ;;
@@ -418,7 +437,21 @@ function cmd_create() {
         local ci_dir
         ci_dir=$(mktemp -d)
 
-        cat > "${ci_dir}/user-data" <<CIEOF
+        if [[ "$stealth" == true ]]; then
+            cat > "${ci_dir}/user-data" <<CIEOF
+#cloud-config
+users:
+  - name: ubuntu
+    lock_passwd: true
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${pub_key}
+ssh_pwauth: false
+package_update: true
+CIEOF
+        else
+            cat > "${ci_dir}/user-data" <<CIEOF
 #cloud-config
 users:
   - name: ubuntu
@@ -435,6 +468,7 @@ packages:
 runcmd:
   - systemctl enable --now qemu-guest-agent
 CIEOF
+        fi
 
         cat > "${ci_dir}/meta-data" <<CIEOF
 instance-id: ${name}
@@ -444,23 +478,44 @@ CIEOF
         cloud-localds "$seed_path" "${ci_dir}/user-data" "${ci_dir}/meta-data"
         rm -rf "$ci_dir"
 
-        virt-install \
-            --name "$name" \
-            --vcpus "$cpu" \
-            --memory "$ram_mib" \
-            --disk "path=${disk_path},format=qcow2,bus=virtio" \
-            --disk "path=${seed_path},device=cdrom" \
-            --os-variant ubuntu24.04 \
-            --network network=default,model=virtio \
-            --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
-            --graphics none \
-            --import \
-            --noautoconsole
+        if [[ "$stealth" == true ]]; then
+            virt-install \
+                --name "$name" \
+                --vcpus "$cpu" \
+                --memory "$ram_mib" \
+                --disk "path=${disk_path},format=qcow2,bus=sata" \
+                --disk "path=${seed_path},device=cdrom" \
+                --os-variant ubuntu24.04 \
+                --network network=default \
+                --graphics none \
+                --import \
+                --noreboot \
+                --noautoconsole
+        else
+            virt-install \
+                --name "$name" \
+                --vcpus "$cpu" \
+                --memory "$ram_mib" \
+                --disk "path=${disk_path},format=qcow2,bus=virtio" \
+                --disk "path=${seed_path},device=cdrom" \
+                --os-variant ubuntu24.04 \
+                --network network=default,model=virtio \
+                --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
+                --graphics none \
+                --import \
+                --noautoconsole
+        fi
 
         log_msg INFO "VM '$name' created — SSH key: ${KVM_SSH_KEY}"
         log_msg INFO "Connect with '$SCRIPT_NAME ssh $name'"
     else
         die "Specify --template, --iso, or --cloud-image to create a VM"
+    fi
+
+    if [[ "$stealth" == true ]]; then
+        log_msg INFO "Applying stealth hardening..."
+        cmd_harden "$name" --verify
+        virsh start "$name" >/dev/null
     fi
 
     log_msg PHASE "VM '$name' ready"
@@ -967,6 +1022,186 @@ function cmd_power() {
     esac
 }
 
+# --- Anti-Detection Hardening ---
+
+function cmd_harden() {
+    check_root
+    if [[ $# -lt 1 ]]; then
+        die "Usage: $SCRIPT_NAME harden <vm-name> [--profile N] [--verify]"
+    fi
+
+    local name="$1"; shift
+    local profile_idx="" verify=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) profile_idx="$2"; shift 2 ;;
+            --verify)  verify=true; shift ;;
+            *)         die "Unknown option: $1" ;;
+        esac
+    done
+
+    require_vm "$name"
+
+    local state
+    state=$(get_vm_state "$name")
+    if [[ "$state" != "shut off" ]]; then
+        die "VM '$name' must be shut off for hardening (current state: $state)"
+    fi
+
+    # Select hardware profile
+    if [[ -z "$profile_idx" ]]; then
+        profile_idx=$((RANDOM % ${#STEALTH_PROFILES[@]}))
+    fi
+    if [[ $profile_idx -ge ${#STEALTH_PROFILES[@]} ]]; then
+        die "Invalid profile index: $profile_idx (available: 0-$((${#STEALTH_PROFILES[@]} - 1)))"
+    fi
+
+    local profile="${STEALTH_PROFILES[$profile_idx]}"
+    local manufacturer product bios_vendor bios_version mac_oui
+    IFS='|' read -r manufacturer product bios_vendor bios_version mac_oui <<< "$profile"
+
+    local serial
+    serial=$(generate_serial)
+
+    log_msg PHASE "Hardening VM '$name' with $manufacturer $product profile"
+
+    # 1. SMBIOS/DMI spoofing
+    log_msg INFO "Setting SMBIOS: $manufacturer $product (serial: $serial)"
+    local xml_file
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+
+    # Add or update sysinfo block
+    if grep -q '<sysinfo' "$xml_file"; then
+        # Remove existing sysinfo block, we'll add a fresh one
+        sed -i '/<sysinfo/,/<\/sysinfo>/d' "$xml_file"
+    fi
+
+    # Insert sysinfo before </domain>
+    sed -i "s|</domain>|  <sysinfo type=\"smbios\">\n    <bios>\n      <entry name=\"vendor\">${bios_vendor}</entry>\n      <entry name=\"version\">${bios_version}</entry>\n    </bios>\n    <system>\n      <entry name=\"manufacturer\">${manufacturer}</entry>\n      <entry name=\"product\">${product}</entry>\n      <entry name=\"serial\">${serial}</entry>\n    </system>\n  </sysinfo>\n</domain>|" "$xml_file"
+
+    # Ensure <smbios mode="sysinfo"/> is in <os> block
+    if ! grep -q 'smbios mode' "$xml_file"; then
+        sed -i 's|</os>|  <smbios mode="sysinfo"/>\n  </os>|' "$xml_file"
+    fi
+
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 2. Hide KVM hypervisor
+    log_msg INFO "Hiding KVM hypervisor signature"
+    virt-xml "$name" --edit --features kvm.hidden.state=on --define >/dev/null 2>&1 || {
+        # Fallback: inject via XML if virt-xml fails
+        xml_file=$(mktemp)
+        virsh dumpxml "$name" --inactive > "$xml_file"
+        if ! grep -q 'kvm' "$xml_file" || ! grep -q '<hidden' "$xml_file"; then
+            if grep -q '<features>' "$xml_file"; then
+                sed -i 's|</features>|  <kvm>\n      <hidden state="on"/>\n    </kvm>\n  </features>|' "$xml_file"
+            fi
+        fi
+        virsh define "$xml_file" >/dev/null
+        rm -f "$xml_file"
+    }
+
+    # 3. MAC address randomization
+    local new_mac
+    new_mac=$(generate_mac "$mac_oui")
+    log_msg INFO "Setting MAC address: $new_mac ($manufacturer OUI)"
+    virt-xml "$name" --edit --network mac.address="$new_mac" --define >/dev/null 2>&1 || {
+        log_msg WARN "Could not update MAC via virt-xml — update manually with 'virsh edit $name'"
+    }
+
+    # 4. Disk bus: virtio -> sata
+    log_msg INFO "Changing disk bus to SATA"
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    if grep -q "bus='virtio'" "$xml_file" && grep -q "device='disk'" "$xml_file"; then
+        # Change virtio disk bus to sata, update target dev from vd* to sd*
+        sed -i "/<disk type=.*device='disk'/,/<\/disk>/ {
+            s/bus='virtio'/bus='sata'/
+            s/dev='vd/dev='sd/
+        }" "$xml_file"
+        # Add SATA controller if not present
+        if ! grep -q "type='sata'" "$xml_file"; then
+            sed -i "s|</devices>|  <controller type=\"sata\" index=\"0\"/>\n  </devices>|" "$xml_file"
+        fi
+        virsh define "$xml_file" >/dev/null
+    else
+        log_msg INFO "Disk bus already non-virtio, skipping"
+    fi
+    rm -f "$xml_file"
+
+    # 5. Remove QEMU guest agent channel
+    log_msg INFO "Removing QEMU guest agent channel"
+    virt-xml "$name" --remove-device --channel target.name=org.qemu.guest_agent.0 --define >/dev/null 2>&1 || {
+        log_msg INFO "No guest agent channel found (already removed or never added)"
+    }
+
+    # Verification
+    if [[ "$verify" == true ]]; then
+        log_msg PHASE "Verification:"
+        local xml
+        xml=$(virsh dumpxml "$name" --inactive)
+
+        local checks=0 passed=0
+
+        # Note: virsh dumpxml uses single quotes and lowercase MAC
+        local new_mac_lower
+        new_mac_lower=$(echo "$new_mac" | tr '[:upper:]' '[:lower:]')
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "name=.manufacturer.>${manufacturer}<"; then
+            log_msg INFO "  [PASS] SMBIOS manufacturer: $manufacturer"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] SMBIOS manufacturer not set"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "hidden state=.on."; then
+            log_msg INFO "  [PASS] KVM hidden state: on"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] KVM hidden state not set"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "address=.${new_mac_lower}."; then
+            log_msg INFO "  [PASS] MAC address: $new_mac_lower"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] MAC address not updated"
+        fi
+
+        checks=$((checks + 1))
+        if ! echo "$xml" | grep -q "device='disk'" || ! echo "$xml" | grep -A5 "device='disk'" | grep -q "bus='virtio'"; then
+            log_msg INFO "  [PASS] Disk bus: non-virtio"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Disk still using virtio bus"
+        fi
+
+        checks=$((checks + 1))
+        if ! echo "$xml" | grep -q 'org.qemu.guest_agent'; then
+            log_msg INFO "  [PASS] Guest agent: removed"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Guest agent channel still present"
+        fi
+
+        log_msg INFO "  Result: $passed/$checks checks passed"
+    fi
+
+    log_msg PHASE "VM '$name' hardened"
+    log_msg INFO "  Profile:    $manufacturer $product"
+    log_msg INFO "  Serial:     $serial"
+    log_msg INFO "  MAC:        $new_mac"
+    log_msg INFO "  Disk bus:   SATA"
+    log_msg INFO "  Hypervisor: hidden"
+    log_msg WARN "Note: IP detection may be slower without guest agent"
+}
+
 # --- Usage ---
 
 function usage() {
@@ -1000,6 +1235,12 @@ ${BOLD}SNAPSHOTS${RESET} (fast rollback for testing)
     rollback <vm> <snapshot-name>       Revert to a snapshot (sub-second)
     snap-list <vm>                      List snapshots for a VM
     snap-delete <vm> <snapshot-name>    Delete a snapshot
+
+${BOLD}ANTI-DETECTION${RESET} (malware analysis sandbox hardening)
+    harden <vm> [options]               Apply anti-detection hardening to shut-off VM
+        --profile <N>                     Hardware profile: 0=Dell, 1=Lenovo, 2=HP (default: random)
+        --verify                          Verify all hardening changes were applied
+    create <name> --cloud-image --stealth  Create a pre-hardened VM in one step
 
 ${BOLD}MONITORING & ACCESS${RESET}
     status <vm>                         Detailed VM information
@@ -1042,6 +1283,7 @@ function main() {
         setup|help|--help|-h) ;;
         create)          require_deps virsh virt-install virt-clone qemu-img wget cloud-localds ;;
         clone)           require_deps virsh virt-clone ;;
+        harden)          require_deps virsh virt-xml sed ;;
         status)          require_deps virsh qemu-img ;;
         ssh)             require_deps virsh ssh ;;
         list|delete|template-create|template-list|\
@@ -1066,6 +1308,7 @@ function main() {
         monitor)         cmd_monitor "$@" ;;
         console)         cmd_console "$@" ;;
         ssh)             cmd_ssh "$@" ;;
+        harden)          cmd_harden "$@" ;;
         start)           cmd_power start "$@" ;;
         stop)            cmd_power stop "$@" ;;
         restart)         cmd_power restart "$@" ;;
