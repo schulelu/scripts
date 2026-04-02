@@ -70,7 +70,7 @@ phase_done() {
 # ============================================================================
 # Phase 1: System packages
 # ============================================================================
-phase "Phase 1/11: Installing system packages..."
+phase "Phase 1/12: Installing system packages..."
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -94,7 +94,7 @@ phase_done
 # ============================================================================
 # Phase 2: Binary installs (tools not in apt)
 # ============================================================================
-phase "Phase 2/11: Installing binary tools (eza, dust, sd, procs, starship)..."
+phase "Phase 2/12: Installing binary tools (eza, dust, sd, procs, starship)..."
 
 ARCH=$(dpkg --print-architecture)
 
@@ -187,7 +187,7 @@ phase_done
 # ============================================================================
 # Phase 3: Shell configuration
 # ============================================================================
-phase "Phase 3/11: Configuring shell (aliases, zoxide, fzf, starship)..."
+phase "Phase 3/12: Configuring shell (aliases, zoxide, fzf, starship)..."
 
 # Create ~/.local/bin and symlink batcat → bat
 run_as_user "mkdir -p ${TARGET_HOME}/.local/bin"
@@ -240,7 +240,7 @@ phase_done
 # ============================================================================
 # Phase 4: Miniconda
 # ============================================================================
-phase "Phase 4/11: Installing Miniconda..."
+phase "Phase 4/12: Installing Miniconda..."
 
 if [[ ! -d "${TARGET_HOME}/miniconda3/bin" ]]; then
     run_as_user "mkdir -p ${TARGET_HOME}/miniconda3"
@@ -267,7 +267,7 @@ phase_done
 # ============================================================================
 # Phase 5: NVM + Node
 # ============================================================================
-phase "Phase 5/11: Installing NVM + Node..."
+phase "Phase 5/12: Installing NVM + Node..."
 
 NVM_VERSION="0.40.4"
 NODE_VERSION="22"
@@ -295,7 +295,7 @@ phase_done
 # ============================================================================
 # Phase 6: Nginx + self-signed SSL
 # ============================================================================
-phase "Phase 6/11: Configuring Nginx with self-signed SSL..."
+phase "Phase 6/12: Configuring Nginx with self-signed SSL..."
 
 # Create SSL directories
 mkdir -p /etc/nginx/snippets/ssl
@@ -457,7 +457,7 @@ phase_done
 # ============================================================================
 # Phase 7: System Dashboard
 # ============================================================================
-phase "Phase 7/11: Installing system dashboard..."
+phase "Phase 7/12: Installing system dashboard..."
 
 mkdir -p /var/www
 
@@ -730,7 +730,7 @@ phase_done
 # ============================================================================
 # Phase 8: UFW Firewall
 # ============================================================================
-phase "Phase 8/11: Configuring UFW firewall..."
+phase "Phase 8/12: Configuring UFW firewall..."
 
 ufw default deny incoming
 ufw default allow outgoing
@@ -746,7 +746,7 @@ phase_done
 # ============================================================================
 # Phase 9: earlyoom — userspace OOM killer (replaces systemd-oomd)
 # ============================================================================
-phase "Phase 9/11: Configuring earlyoom..."
+phase "Phase 9/12: Configuring earlyoom..."
 
 apt-get install -y -qq earlyoom
 
@@ -774,7 +774,7 @@ phase_done
 # ============================================================================
 # Phase 10: sysctl tuning
 # ============================================================================
-phase "Phase 10/11: Applying sysctl optimizations..."
+phase "Phase 10/12: Applying sysctl optimizations..."
 
 SYSCTL_MARKER="# --- vm-post-setup ---"
 if ! grep -qF "$SYSCTL_MARKER" /etc/sysctl.conf 2>/dev/null; then
@@ -855,7 +855,7 @@ phase_done
 # ============================================================================
 # Phase 11: MOTD — Cybersecurity-themed login banner
 # ============================================================================
-phase "Phase 11/11: Installing MOTD..."
+phase "Phase 11/12: Installing MOTD..."
 
 # Disable default Ubuntu MOTD components
 chmod -x /etc/update-motd.d/* 2>/dev/null || true
@@ -989,6 +989,81 @@ log "Cybersecurity MOTD installed"
 phase_done
 
 # ============================================================================
+# Phase 12: NVIDIA GPU driver + CUDA toolkit (conditional)
+# ============================================================================
+phase "Phase 12/12: Checking for NVIDIA GPU..."
+
+GPU_DETECTED=false
+if lspci -nn 2>/dev/null | grep -qi 'nvidia.*\(3d controller\|vga compatible\)'; then
+    GPU_DETECTED=true
+elif [[ -f /opt/.gpu-passthrough ]]; then
+    GPU_DETECTED=true
+    log "GPU detected via passthrough marker"
+fi
+
+GPU_SUMMARY=""
+if [[ "$GPU_DETECTED" == true ]]; then
+    log "NVIDIA GPU detected — installing driver + CUDA toolkit..."
+
+    # Prerequisites
+    apt-get install -y -qq linux-headers-"$(uname -r)" dkms
+
+    # Add NVIDIA CUDA repository (Ubuntu 24.04 Noble)
+    if [[ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ]]; then
+        CUDA_DISTRO="ubuntu2404"
+        if [[ "$ARCH" == "arm64" || "$ARCH" == "aarch64" ]]; then
+            CUDA_ARCH="arm64"
+        else
+            CUDA_ARCH="x86_64"
+        fi
+        log "Adding NVIDIA CUDA repository (${CUDA_DISTRO}/${CUDA_ARCH})..."
+        wget --timeout=30 --tries=3 -qO /tmp/cuda-keyring.deb \
+            "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_DISTRO}/${CUDA_ARCH}/cuda-keyring_1.1-1_all.deb"
+        dpkg -i /tmp/cuda-keyring.deb
+        rm -f /tmp/cuda-keyring.deb
+        apt-get update -qq
+    fi
+
+    # Install NVIDIA driver + CUDA toolkit
+    log "Installing CUDA (driver + toolkit) — this may take several minutes..."
+    apt-get install -y -qq cuda 2>/dev/null || {
+        warn "cuda meta-package failed, trying ubuntu-drivers fallback..."
+        ubuntu-drivers autoinstall 2>/dev/null || true
+        apt-get install -y -qq cuda-toolkit 2>/dev/null || true
+    }
+
+    # Verify driver
+    if command -v nvidia-smi &>/dev/null; then
+        log "NVIDIA driver installed:"
+        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | \
+            while IFS= read -r line; do log "  $line"; done
+    else
+        warn "nvidia-smi not found — driver may need a reboot to load"
+    fi
+
+    # Add CUDA to PATH for target user
+    CUDA_BASHRC_MARKER="# --- cuda-setup ---"
+    if ! grep -qF "$CUDA_BASHRC_MARKER" "${TARGET_HOME}/.bashrc" 2>/dev/null; then
+        cat >> "${TARGET_HOME}/.bashrc" <<'CUDABASHRC'
+
+# --- cuda-setup ---
+export PATH="/usr/local/cuda/bin:${PATH}"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+# --- end cuda-setup ---
+CUDABASHRC
+        chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.bashrc"
+    fi
+
+    GPU_SUMMARY="  GPU:        NVIDIA driver + CUDA toolkit"
+    log "NVIDIA GPU driver + CUDA toolkit installed"
+    log "  Run 'nvidia-smi' to verify GPU access"
+    log "  Run 'nvcc --version' to verify CUDA compiler"
+else
+    log "No NVIDIA GPU detected — skipping driver installation"
+fi
+phase_done
+
+# ============================================================================
 # Done
 # ============================================================================
 date -Iseconds > "$DONE_MARKER"
@@ -999,5 +1074,6 @@ log "  Modern CLI: bat, eza, rg, fd, fzf, zoxide, btop, dust, duf, delta, sd, pr
 log "  Dev envs:   Miniconda (conda), NVM + Node ${NODE_VERSION} + PM2 + tldr"
 log "  Web:        Nginx + self-signed SSL (10yr) + system dashboard"
 log "  Security:   UFW (zero-trust), earlyoom, sysctl hardened"
+[[ -n "$GPU_SUMMARY" ]] && log "$GPU_SUMMARY"
 log ""
 log "Log out and back in (or 'source ~/.bashrc') for shell changes to take effect"

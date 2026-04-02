@@ -18,6 +18,12 @@ KVM_SSH_KEY="" # Set dynamically in main() via get_kvm_ssh_key_path
 CLOUD_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 DEFAULT_POST_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vm-post-setup.sh"
 
+# --- GPU Passthrough (VFIO) ---
+VFIO_CONF="/etc/modprobe.d/vfio.conf"
+VFIO_MODULES_CONF="/etc/modules-load.d/vfio.conf"
+GPU_PCI_ADDRS=()   # Set by detect_nvidia_gpu()
+GPU_VFIO_IDS=""    # Set by detect_nvidia_gpu()
+
 # --- Anti-Detection Hardware Profiles ---
 # Format: manufacturer|product|bios_vendor|bios_version|mac_oui
 STEALTH_PROFILES=(
@@ -153,6 +159,117 @@ function require_deps() {
     fi
 
     die "Cannot continue without: ${missing[*]}"
+}
+
+# --- GPU Passthrough Helpers ---
+
+function detect_nvidia_gpu() {
+    # Detect NVIDIA GPU and all IOMMU group siblings for passthrough.
+    # Sets globals: GPU_PCI_ADDRS=() and GPU_VFIO_IDS=""
+    GPU_PCI_ADDRS=()
+    GPU_VFIO_IDS=""
+
+    local gpu_line
+    gpu_line=$(lspci -nn 2>/dev/null | grep -iE '\[10de:[0-9a-f]+\]' | grep -iE '(VGA|3D|Display)' | head -1) || true
+    if [[ -z "$gpu_line" ]]; then
+        return 1
+    fi
+
+    local gpu_addr
+    gpu_addr=$(echo "$gpu_line" | awk '{print $1}')
+    local gpu_slot="${gpu_addr%.*}"  # e.g. 01:00
+
+    log_msg INFO "Detected NVIDIA GPU at PCI ${gpu_addr}: $(echo "$gpu_line" | cut -d' ' -f2-)"
+
+    # Try IOMMU groups first (available after IOMMU is enabled)
+    local iommu_group_dir=""
+    if [[ -d /sys/kernel/iommu_groups ]]; then
+        local group_path
+        for group_path in /sys/kernel/iommu_groups/*/devices/0000:${gpu_addr}; do
+            if [[ -e "$group_path" ]]; then
+                iommu_group_dir=$(dirname "$group_path")
+                break
+            fi
+        done
+    fi
+
+    local -a addrs=()
+    local -a ids=()
+
+    if [[ -n "$iommu_group_dir" ]]; then
+        # Use actual IOMMU group
+        local dev
+        for dev in "${iommu_group_dir}"/0000:*; do
+            [[ -e "$dev" ]] || continue
+            local addr
+            addr=$(basename "$dev" | sed 's/^0000://')
+            addrs+=("$addr")
+            local dev_id
+            dev_id=$(lspci -n -s "$addr" 2>/dev/null | awk '{print $3}')
+            ids+=("$dev_id")
+        done
+    else
+        # Fallback: scan all functions on same bus:slot (pre-IOMMU)
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local addr
+            addr=$(echo "$line" | awk '{print $1}')
+            addrs+=("$addr")
+            local dev_id
+            dev_id=$(lspci -n -s "$addr" 2>/dev/null | awk '{print $3}')
+            ids+=("$dev_id")
+        done < <(lspci -nn 2>/dev/null | grep "^${gpu_slot}\.")
+    fi
+
+    if [[ ${#addrs[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    GPU_PCI_ADDRS=("${addrs[@]}")
+    GPU_VFIO_IDS=$(IFS=,; echo "${ids[*]}")
+
+    local i
+    for i in "${!addrs[@]}"; do
+        local desc
+        desc=$(lspci -s "${addrs[$i]}" 2>/dev/null | cut -d' ' -f2-)
+        log_msg INFO "  IOMMU group device: ${addrs[$i]} [${ids[$i]}] — $desc"
+    done
+
+    return 0
+}
+
+function check_vfio_ready() {
+    # Verify IOMMU is enabled and GPU is bound to vfio-pci
+    if ! grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
+        return 1
+    fi
+
+    if [[ ${#GPU_PCI_ADDRS[@]} -eq 0 ]]; then
+        detect_nvidia_gpu || return 1
+    fi
+
+    local addr
+    for addr in "${GPU_PCI_ADDRS[@]}"; do
+        local driver_link="/sys/bus/pci/devices/0000:${addr}/driver"
+        if [[ -L "$driver_link" ]]; then
+            local current_driver
+            current_driver=$(basename "$(readlink "$driver_link")")
+            if [[ "$current_driver" != "vfio-pci" ]]; then
+                return 1
+            fi
+        else
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+function pci_to_virsh_hostdev() {
+    # Convert PCI address "01:00.0" to virsh format "pci_0000_01_00_0"
+    local addr="$1"
+    echo "pci_0000_${addr//:/_}" | sed 's/\./_/g'
 }
 
 function get_kvm_ssh_key_path() {
@@ -308,6 +425,83 @@ function cmd_setup() {
         log_msg WARN "Log out and back in for group membership to take effect"
     fi
 
+    log_msg PHASE "KVM setup complete"
+
+    # --- GPU Passthrough (VFIO) Setup ---
+    log_msg PHASE "Configuring GPU passthrough..."
+
+    if ! detect_nvidia_gpu; then
+        log_msg INFO "No NVIDIA GPU detected — skipping GPU passthrough setup"
+        return 0
+    fi
+
+    local NEEDS_REBOOT=false
+
+    # 1. Enable IOMMU in GRUB
+    local iommu_param
+    if grep -q GenuineIntel /proc/cpuinfo 2>/dev/null; then
+        iommu_param="intel_iommu=on"
+    else
+        iommu_param="amd_iommu=on"
+    fi
+
+    if grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
+        log_msg INFO "IOMMU already enabled in kernel cmdline"
+    else
+        log_msg INFO "Enabling IOMMU in GRUB configuration..."
+        if [[ -f /etc/default/grub ]]; then
+            local current_cmdline
+            current_cmdline=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="//' | sed 's/"$//')
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${current_cmdline} ${iommu_param} iommu=pt\"|" /etc/default/grub
+            update-grub 2>/dev/null
+            log_msg INFO "GRUB updated with '${iommu_param} iommu=pt'"
+            NEEDS_REBOOT=true
+        else
+            log_msg WARN "Cannot find /etc/default/grub — add '${iommu_param} iommu=pt' to kernel cmdline manually"
+        fi
+    fi
+
+    # 2. Configure VFIO to claim GPU at boot
+    log_msg INFO "Writing VFIO modprobe configuration..."
+    cat > "$VFIO_CONF" <<VFIOEOF
+# GPU passthrough — generated by $SCRIPT_NAME
+# Devices: ${GPU_PCI_ADDRS[*]}
+options vfio-pci ids=${GPU_VFIO_IDS}
+softdep nvidia pre: vfio-pci
+softdep nvidia_drm pre: vfio-pci
+softdep nvidia_uvm pre: vfio-pci
+softdep nvidia_modeset pre: vfio-pci
+softdep nouveau pre: vfio-pci
+VFIOEOF
+    log_msg INFO "Written $VFIO_CONF (IDs: ${GPU_VFIO_IDS})"
+
+    # 3. Load VFIO modules early via initramfs
+    cat > "$VFIO_MODULES_CONF" <<'MODEOF'
+vfio
+vfio_iommu_type1
+vfio_pci
+MODEOF
+    log_msg INFO "Written $VFIO_MODULES_CONF"
+
+    log_msg INFO "Rebuilding initramfs..."
+    update-initramfs -u 2>/dev/null
+    log_msg INFO "initramfs rebuilt"
+
+    # 4. Reboot warning
+    if [[ "$NEEDS_REBOOT" == true ]]; then
+        echo ""
+        log_msg WARN "════════════════════════════════════════════"
+        log_msg WARN "  REBOOT REQUIRED for GPU passthrough"
+        log_msg WARN "  IOMMU + VFIO configuration written."
+        log_msg WARN "  After reboot, the NVIDIA GPU will be"
+        log_msg WARN "  bound to vfio-pci and available for VMs."
+        log_msg WARN "════════════════════════════════════════════"
+        log_msg INFO "After reboot, verify with: $SCRIPT_NAME gpu-status"
+        echo ""
+    else
+        log_msg INFO "VFIO configuration updated. Verify with: $SCRIPT_NAME gpu-status"
+    fi
+
     log_msg PHASE "Setup complete"
 }
 
@@ -326,7 +520,7 @@ function cmd_create() {
         die "VM '$name' already exists"
     fi
 
-    local template="" iso="" cloud_image=false stealth=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
+    local template="" iso="" cloud_image=false stealth=false gpu=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
     local post_setup="" post_setup_script=""
 
     while [[ $# -gt 0 ]]; do
@@ -335,6 +529,7 @@ function cmd_create() {
             --iso)         iso="$2"; shift 2 ;;
             --cloud-image) cloud_image=true; shift ;;
             --stealth)     stealth=true; shift ;;
+            --gpu)         gpu=true; shift ;;
             --post-setup)
                 post_setup=true
                 # Next arg is optional path (if it doesn't start with --)
@@ -373,6 +568,21 @@ function cmd_create() {
     [[ "$cloud_image" == true ]] && source_count=$((source_count + 1))
     if [[ $source_count -gt 1 ]]; then
         die "Cannot combine --template, --iso, and --cloud-image"
+    fi
+
+    # GPU passthrough validation
+    if [[ "$gpu" == true ]]; then
+        if [[ "$stealth" == true ]]; then
+            die "Cannot combine --gpu with --stealth (GPU passthrough exposes real hardware)"
+        fi
+        if ! check_vfio_ready; then
+            die "GPU passthrough not ready — run '$SCRIPT_NAME setup' and reboot first (check with '$SCRIPT_NAME gpu-status')"
+        fi
+        detect_nvidia_gpu || die "No NVIDIA GPU detected for passthrough"
+        if [[ $ram_mib -lt 8192 ]]; then
+            log_msg WARN "GPU workloads typically need ≥8G RAM (current: ${ram_mib}M)"
+        fi
+        log_msg INFO "GPU passthrough: ${GPU_PCI_ADDRS[*]} → VM '$name'"
     fi
 
     if [[ -n "$template" ]]; then
@@ -426,18 +636,29 @@ function cmd_create() {
 
         log_msg PHASE "Creating VM '$name' from ISO"
 
-        virt-install \
-            --name "$name" \
-            --vcpus "$cpu" \
-            --memory "$ram_mib" \
-            --disk "path=${LIBVIRT_IMAGES}/${name}.qcow2,size=${disk_gb},format=qcow2,bus=virtio" \
-            --location "$iso_path,kernel=casper/vmlinuz,initrd=casper/initrd" \
-            --extra-args "console=ttyS0" \
-            --os-variant detect=on \
-            --network network=default,model=virtio \
-            --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
-            --graphics none \
+        local -a vi_args=(
+            --name "$name"
+            --vcpus "$cpu"
+            --memory "$ram_mib"
+            --disk "path=${LIBVIRT_IMAGES}/${name}.qcow2,size=${disk_gb},format=qcow2,bus=virtio"
+            --location "$iso_path,kernel=casper/vmlinuz,initrd=casper/initrd"
+            --extra-args "console=ttyS0"
+            --os-variant detect=on
+            --network network=default,model=virtio
+            --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0
+            --graphics none
             --noautoconsole
+        )
+
+        if [[ "$gpu" == true ]]; then
+            vi_args+=(--machine q35)
+            local pci_addr
+            for pci_addr in "${GPU_PCI_ADDRS[@]}"; do
+                vi_args+=(--host-device "$(pci_to_virsh_hostdev "$pci_addr")")
+            done
+        fi
+
+        virt-install "${vi_args[@]}"
 
         log_msg INFO "VM '$name' created — attach with 'virsh console $name'"
 
@@ -513,6 +734,22 @@ function cmd_create() {
             fi
         fi
 
+        # GPU passthrough marker for vm-post-setup.sh
+        if [[ "$gpu" == true ]]; then
+            local gpu_marker="  - path: /opt/.gpu-passthrough
+    permissions: '0644'
+    content: |
+      GPU_PCI_ADDRESSES=\"${GPU_PCI_ADDRS[*]}\"
+      GPU_VENDOR=nvidia"
+            if [[ -n "$ci_write_files" ]]; then
+                ci_write_files="${ci_write_files}
+${gpu_marker}"
+            else
+                ci_write_files="write_files:
+${gpu_marker}"
+            fi
+        fi
+
         {
             cat <<CIEOF
 #cloud-config
@@ -557,18 +794,30 @@ CIEOF
                 --noreboot \
                 --noautoconsole
         else
-            virt-install \
-                --name "$name" \
-                --vcpus "$cpu" \
-                --memory "$ram_mib" \
-                --disk "path=${disk_path},format=qcow2,bus=virtio" \
-                --disk "path=${seed_path},device=cdrom" \
-                --os-variant ubuntu24.04 \
-                --network network=default,model=virtio \
-                --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
-                --graphics none \
-                --import \
+            local -a vi_cloud_args=(
+                --name "$name"
+                --vcpus "$cpu"
+                --memory "$ram_mib"
+                --disk "path=${disk_path},format=qcow2,bus=virtio"
+                --disk "path=${seed_path},device=cdrom"
+                --os-variant ubuntu24.04
+                --network network=default,model=virtio
+                --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0
+                --graphics none
+                --import
                 --noautoconsole
+            )
+
+            if [[ "$gpu" == true ]]; then
+                vi_cloud_args+=(--machine q35)
+                local pci_addr
+                for pci_addr in "${GPU_PCI_ADDRS[@]}"; do
+                    vi_cloud_args+=(--host-device "$(pci_to_virsh_hostdev "$pci_addr")")
+                done
+                log_msg INFO "GPU passthrough: attaching ${#GPU_PCI_ADDRS[@]} PCI device(s) to VM"
+            fi
+
+            virt-install "${vi_cloud_args[@]}"
         fi
 
         log_msg INFO "VM '$name' created — SSH key: ${KVM_SSH_KEY}"
@@ -1205,6 +1454,70 @@ function cmd_autostart() {
     esac
 }
 
+# --- GPU Passthrough Status ---
+
+function cmd_gpu_status() {
+    log_msg PHASE "GPU Passthrough Status"
+    echo ""
+
+    # IOMMU
+    if grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
+        log_msg INFO "IOMMU:          ${GREEN}enabled${RESET}"
+    else
+        log_msg WARN "IOMMU:          ${RED}disabled${RESET} — run '$SCRIPT_NAME setup' and reboot"
+    fi
+
+    # IOMMU groups
+    local group_count=0
+    if [[ -d /sys/kernel/iommu_groups ]]; then
+        group_count=$(ls /sys/kernel/iommu_groups/ 2>/dev/null | wc -l)
+    fi
+    if [[ $group_count -gt 0 ]]; then
+        log_msg INFO "IOMMU groups:   ${GREEN}${group_count} groups${RESET}"
+    else
+        log_msg WARN "IOMMU groups:   ${RED}none${RESET} (IOMMU not active — reboot needed after setup)"
+    fi
+
+    # GPU detection
+    if detect_nvidia_gpu; then
+        local addr
+        for addr in "${GPU_PCI_ADDRS[@]}"; do
+            local driver_link="/sys/bus/pci/devices/0000:${addr}/driver"
+            local current_driver="unbound"
+            if [[ -L "$driver_link" ]]; then
+                current_driver=$(basename "$(readlink "$driver_link")")
+            fi
+            local desc
+            desc=$(lspci -s "$addr" 2>/dev/null | cut -d' ' -f2-)
+            if [[ "$current_driver" == "vfio-pci" ]]; then
+                log_msg INFO "  ${addr}:  ${GREEN}vfio-pci${RESET} — $desc"
+            else
+                log_msg WARN "  ${addr}:  ${YELLOW}${current_driver}${RESET} — $desc"
+            fi
+        done
+        log_msg INFO "VFIO IDs:       ${GPU_VFIO_IDS}"
+    else
+        log_msg WARN "No NVIDIA GPU detected"
+    fi
+
+    # Overall readiness
+    echo ""
+    if check_vfio_ready; then
+        log_msg PHASE "${GREEN}GPU passthrough is READY${RESET} — use '--gpu' when creating VMs"
+    else
+        log_msg WARN "GPU passthrough is NOT ready"
+        if ! grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
+            log_msg INFO "  → Run: sudo $SCRIPT_NAME setup"
+            log_msg INFO "  → Then reboot the host"
+        elif [[ $group_count -eq 0 ]]; then
+            log_msg INFO "  → Reboot the host to activate IOMMU"
+        else
+            log_msg INFO "  → GPU is not bound to vfio-pci — check $VFIO_CONF"
+        fi
+    fi
+    echo ""
+}
+
 # --- Power Management ---
 
 function cmd_power() {
@@ -1461,6 +1774,7 @@ ${BOLD}VM LIFECYCLE${RESET}
         --cpu <N>                         vCPU count (default: $DEFAULT_CPU)
         --ram <size>                      RAM size, e.g. 2G, 512M (default: ${DEFAULT_RAM_MIB}M)
         --disk <size>                     Disk size, e.g. 20G, 1T (default: ${DEFAULT_DISK_GB}G)
+        --gpu                             Pass through host NVIDIA GPU (VFIO, requires setup first)
         --post-setup [path]               Run post-setup script on first boot (cloud-image only)
     delete <name> [--force]             Delete VM and all its storage
     list                                List all VMs with status
@@ -1487,6 +1801,9 @@ ${BOLD}PROVISIONING${RESET}
                                         Default: vm-post-setup.sh (same directory as kvm-manager)
     analyze <vm> [forensics-args...]    Run vm-forensics analysis on a VM
 
+${BOLD}GPU PASSTHROUGH${RESET} (for LLM/CUDA workloads)
+    gpu-status                          Check GPU passthrough readiness (IOMMU, VFIO, driver)
+
 ${BOLD}MONITORING & ACCESS${RESET}
     status <vm>                         Detailed VM information
     monitor                             Live overview of all VMs (watch mode)
@@ -1507,6 +1824,11 @@ ${BOLD}WORKFLOW EXAMPLES${RESET}
     # Run malware, analyze, then roll back
     $SCRIPT_NAME analyze test-vm
     $SCRIPT_NAME rollback test-vm clean    # sub-second revert!
+
+    # GPU passthrough for LLM workloads (first-time: setup + reboot)
+    $SCRIPT_NAME setup                     # configures IOMMU + VFIO
+    $SCRIPT_NAME gpu-status                # verify after reboot
+    $SCRIPT_NAME create llm-vm --cloud-image --cpu 8 --ram 32G --disk 100G --gpu --post-setup
 EOF
 }
 
@@ -1525,7 +1847,7 @@ function main() {
 
     # Dependency pre-check (skip for setup/help)
     case "$cmd" in
-        setup|help|--help|-h) ;;
+        setup|help|--help|-h|gpu-status) ;;
         create)          require_deps virsh virt-install virt-clone qemu-img wget cloud-localds ;;
         clone)           require_deps virsh virt-clone ;;
         harden)          require_deps virsh virt-xml sed ;;
@@ -1558,6 +1880,7 @@ function main() {
         post-setup)      cmd_post_setup "$@" ;;
         analyze)         cmd_analyze "$@" ;;
         harden)          cmd_harden "$@" ;;
+        gpu-status)      cmd_gpu_status "$@" ;;
         start)           cmd_power start "$@" ;;
         stop)            cmd_power stop "$@" ;;
         restart)         cmd_power restart "$@" ;;
