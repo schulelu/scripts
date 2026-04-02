@@ -16,6 +16,7 @@ LIBVIRT_IMAGES="/var/lib/libvirt/images"
 TEMPLATE_MARKER=".kvm-template"
 KVM_SSH_KEY="" # Set dynamically in main() via get_kvm_ssh_key_path
 CLOUD_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+DEFAULT_POST_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vm-post-setup.sh"
 
 # --- Anti-Detection Hardware Profiles ---
 # Format: manufacturer|product|bios_vendor|bios_version|mac_oui
@@ -77,6 +78,13 @@ function validate_vm_name() {
     local name="$1"
     if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
         die "Invalid VM name '$name' — use alphanumeric, dots, hyphens, underscores"
+    fi
+}
+
+function validate_snap_name() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        die "Invalid snapshot name '$name' — use alphanumeric, dots, hyphens, underscores"
     fi
 }
 
@@ -319,6 +327,7 @@ function cmd_create() {
     fi
 
     local template="" iso="" cloud_image=false stealth=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
+    local post_setup="" post_setup_script=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -326,12 +335,37 @@ function cmd_create() {
             --iso)         iso="$2"; shift 2 ;;
             --cloud-image) cloud_image=true; shift ;;
             --stealth)     stealth=true; shift ;;
+            --post-setup)
+                post_setup=true
+                # Next arg is optional path (if it doesn't start with --)
+                if [[ $# -ge 2 && "${2:0:2}" != "--" ]]; then
+                    post_setup_script="$2"; shift 2
+                else
+                    shift
+                fi
+                ;;
             --cpu)         cpu="$2"; shift 2 ;;
             --ram)         ram_mib=$(parse_ram_to_mib "$2"); shift 2 ;;
             --disk)        disk_gb=$(parse_disk_to_gb "$2"); shift 2 ;;
             *)             die "Unknown option: $1" ;;
         esac
     done
+
+    # Resolve post-setup script path
+    if [[ "$post_setup" == true ]]; then
+        if [[ -z "$post_setup_script" ]]; then
+            if [[ -f "$DEFAULT_POST_SETUP" ]]; then
+                post_setup_script="$DEFAULT_POST_SETUP"
+                log_msg INFO "Using default post-setup script: $post_setup_script"
+            else
+                echo -n "${YELLOW}Post-setup script path: ${RESET}"
+                read -r post_setup_script
+            fi
+        fi
+        if [[ ! -f "$post_setup_script" ]]; then
+            die "Post-setup script not found: $post_setup_script"
+        fi
+    fi
 
     local source_count=0
     [[ -n "$template" ]] && source_count=$((source_count + 1))
@@ -416,12 +450,23 @@ function cmd_create() {
         local disk_path="${LIBVIRT_IMAGES}/${name}.qcow2"
         local seed_path="${LIBVIRT_IMAGES}/${name}-seed.img"
 
-        # Download base image if not cached
+        # Download base image if not cached or stale
+        if [[ -f "$base_img" ]]; then
+            local cache_age_days=$(( ($(date +%s) - $(stat -c%Y "$base_img")) / 86400 ))
+            if [[ $cache_age_days -gt 7 ]]; then
+                log_msg WARN "Cloud image is ${cache_age_days} days old"
+                if confirm "Download fresh cloud image?"; then
+                    rm -f "$base_img"
+                else
+                    log_msg INFO "Using cached image (${cache_age_days}d old)"
+                fi
+            else
+                log_msg INFO "Using cached cloud image (${cache_age_days}d old)"
+            fi
+        fi
         if [[ ! -f "$base_img" ]]; then
             log_msg INFO "Downloading cloud image..."
             wget -q --show-progress -O "$base_img" "$CLOUD_IMAGE_URL"
-        else
-            log_msg INFO "Using cached cloud image: $base_img"
         fi
 
         # Create disk from base image and resize
@@ -437,38 +482,58 @@ function cmd_create() {
         local ci_dir
         ci_dir=$(mktemp -d)
 
-        if [[ "$stealth" == true ]]; then
-            cat > "${ci_dir}/user-data" <<CIEOF
-#cloud-config
-users:
-  - name: ubuntu
-    lock_passwd: true
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys:
-      - ${pub_key}
-ssh_pwauth: false
-package_update: true
-CIEOF
-        else
-            cat > "${ci_dir}/user-data" <<CIEOF
-#cloud-config
-users:
-  - name: ubuntu
-    lock_passwd: true
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys:
-      - ${pub_key}
-ssh_pwauth: false
-package_update: true
-package_upgrade: true
-packages:
-  - qemu-guest-agent
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-CIEOF
+        # Build cloud-init user-data
+        local ci_runcmd="" ci_packages="" ci_write_files=""
+
+        if [[ "$stealth" != true ]]; then
+            ci_packages="packages:
+  - qemu-guest-agent"
+            ci_runcmd="  - systemctl enable --now qemu-guest-agent"
         fi
+
+        if [[ "$post_setup" == true && -n "$post_setup_script" ]]; then
+            local script_size
+            script_size=$(stat -c%s "$post_setup_script")
+            if [[ $script_size -gt 5242880 ]]; then
+                die "Post-setup script is $((script_size/1024))KB — too large for cloud-init (max 5MB). Use 'post-setup' command instead."
+            fi
+            log_msg INFO "Embedding post-setup script into cloud-init ($(( script_size / 1024 ))KB)..."
+            local script_b64
+            script_b64=$(base64 -w0 "$post_setup_script")
+            ci_write_files="write_files:
+  - path: /opt/vm-post-setup.sh
+    permissions: '0755'
+    encoding: b64
+    content: ${script_b64}"
+            if [[ -n "$ci_runcmd" ]]; then
+                ci_runcmd="${ci_runcmd}
+  - bash /opt/vm-post-setup.sh --user ubuntu 2>&1 | tee /var/log/vm-post-setup.log"
+            else
+                ci_runcmd="  - bash /opt/vm-post-setup.sh --user ubuntu 2>&1 | tee /var/log/vm-post-setup.log"
+            fi
+        fi
+
+        {
+            cat <<CIEOF
+#cloud-config
+users:
+  - name: ubuntu
+    lock_passwd: true
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${pub_key}
+ssh_pwauth: false
+package_update: true
+CIEOF
+            [[ "$stealth" != true ]] && echo "package_upgrade: true"
+            [[ -n "$ci_packages" ]] && echo "$ci_packages"
+            [[ -n "$ci_write_files" ]] && echo "$ci_write_files"
+            if [[ -n "$ci_runcmd" ]]; then
+                echo "runcmd:"
+                echo "$ci_runcmd"
+            fi
+        } > "${ci_dir}/user-data"
 
         cat > "${ci_dir}/meta-data" <<CIEOF
 instance-id: ${name}
@@ -516,6 +581,50 @@ CIEOF
         log_msg INFO "Applying stealth hardening..."
         cmd_harden "$name" --verify
         virsh start "$name" >/dev/null
+    fi
+
+    # For cloud-init post-setup: wait for completion and auto-snapshot
+    if [[ "$post_setup" == true && "$cloud_image" == true ]]; then
+        log_msg INFO "Waiting for post-setup to complete (cloud-init)..."
+        log_msg INFO "This may take several minutes. Ctrl+C to skip (you can snapshot manually later)."
+
+        local ip="" waited=0 max_boot_wait=120
+        # Wait for VM to get an IP
+        while [[ -z "$ip" && $waited -lt $max_boot_wait ]]; do
+            sleep 5
+            waited=$((waited + 5))
+            ip=$(get_vm_ip "$name")
+        done
+        if [[ -z "$ip" ]]; then
+            log_msg WARN "Could not detect VM IP after ${max_boot_wait}s — skip auto-snapshot"
+            log_msg INFO "Run '$SCRIPT_NAME post-setup $name' manually or snapshot after cloud-init finishes"
+        else
+            # Poll for the done marker via SSH
+            local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
+            local ssh_key_args=()
+            [[ -r "$KVM_SSH_KEY" ]] && ssh_key_args+=(-i "$KVM_SSH_KEY")
+            local max_setup_wait=900 setup_waited=0
+            while [[ $setup_waited -lt $max_setup_wait ]]; do
+                if ssh -q "${ssh_opts[@]}" "${ssh_key_args[@]}" "ubuntu@${ip}" \
+                    "test -f /opt/.post-setup-done" 2>/dev/null; then
+                    log_msg INFO "Post-setup finished on '$name'"
+                    local snap_name="post-setup"
+                    virsh snapshot-create-as "$name" \
+                        --name "$snap_name" \
+                        --description "Auto-snapshot after post-setup at $(date '+%Y-%m-%d %H:%M:%S')" \
+                        --atomic
+                    log_msg PHASE "Snapshot '$snap_name' created — rollback anytime with: $SCRIPT_NAME rollback $name $snap_name"
+                    break
+                fi
+                sleep 15
+                setup_waited=$((setup_waited + 15))
+                [[ $((setup_waited % 60)) -eq 0 ]] && log_msg INFO "Still waiting... (${setup_waited}s)"
+            done
+            if [[ $setup_waited -ge $max_setup_wait ]]; then
+                log_msg WARN "Post-setup did not complete within ${max_setup_wait}s — skipping auto-snapshot"
+                log_msg INFO "Check progress: $SCRIPT_NAME ssh $name 'tail -f /var/log/vm-post-setup.log'"
+            fi
+        fi
     fi
 
     log_msg PHASE "VM '$name' ready"
@@ -733,6 +842,7 @@ function cmd_snap() {
 
     local name="$1" snap_name="$2"
     require_vm "$name"
+    validate_snap_name "$snap_name"
 
     log_msg INFO "Creating snapshot '$snap_name' for VM '$name'..."
 
@@ -759,6 +869,7 @@ function cmd_rollback() {
 
     local name="$1" snap_name="$2"
     require_vm "$name"
+    validate_snap_name "$snap_name"
 
     # Verify snapshot exists
     if ! virsh snapshot-info "$name" "$snap_name" &>/dev/null; then
@@ -817,6 +928,7 @@ function cmd_snap_delete() {
 
     local name="$1" snap_name="$2"
     require_vm "$name"
+    validate_snap_name "$snap_name"
 
     if ! virsh snapshot-info "$name" "$snap_name" &>/dev/null; then
         die "Snapshot '$snap_name' not found for VM '$name'"
@@ -964,6 +1076,133 @@ function cmd_ssh() {
 
     log_msg INFO "SSH to $name ($ssh_target)..."
     exec ssh "${ssh_args[@]}" "$ssh_target" "$@"
+}
+
+# --- Post-Setup ---
+
+function cmd_post_setup() {
+    if [[ $# -lt 1 ]]; then
+        die "Usage: $SCRIPT_NAME post-setup <vm-name> [script-path]"
+    fi
+
+    local name="$1"; shift
+    require_vm "$name"
+
+    local state
+    state=$(get_vm_state "$name")
+    if [[ "$state" != "running" ]]; then
+        die "VM '$name' is $state — start it first"
+    fi
+
+    local ip
+    ip=$(get_vm_ip "$name")
+    if [[ -z "$ip" ]]; then
+        die "Cannot detect IP for '$name' — install qemu-guest-agent in the VM"
+    fi
+
+    # Resolve script path
+    local script_path="${1:-}"
+    if [[ -z "$script_path" ]]; then
+        if [[ -f "$DEFAULT_POST_SETUP" ]]; then
+            script_path="$DEFAULT_POST_SETUP"
+            log_msg INFO "Using default post-setup script: $script_path"
+        else
+            echo -n "${YELLOW}Post-setup script path: ${RESET}"
+            read -r script_path
+        fi
+    fi
+    if [[ ! -f "$script_path" ]]; then
+        die "Post-setup script not found: $script_path"
+    fi
+
+    local ssh_args=()
+    if [[ -r "$KVM_SSH_KEY" ]]; then
+        ssh_args+=(-i "$KVM_SSH_KEY")
+    fi
+
+    local ssh_user="ubuntu"
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+    # Check if already ran
+    local already_ran
+    already_ran=$(ssh "${ssh_opts[@]}" "${ssh_args[@]}" "${ssh_user}@${ip}" \
+        "cat /opt/.post-setup-done 2>/dev/null" 2>/dev/null || true)
+    if [[ -n "$already_ran" ]]; then
+        log_msg WARN "Post-setup already ran on $already_ran"
+        if ! confirm "Run again?"; then
+            log_msg INFO "Cancelled"
+            return
+        fi
+    fi
+
+    log_msg PHASE "Running post-setup on '$name' ($ip)..."
+
+    # Copy script to VM
+    scp "${ssh_opts[@]}" "${ssh_args[@]}" "$script_path" "${ssh_user}@${ip}:/tmp/vm-post-setup.sh"
+
+    # Execute remotely
+    ssh "${ssh_opts[@]}" "${ssh_args[@]}" "${ssh_user}@${ip}" \
+        "sudo bash /tmp/vm-post-setup.sh --user ${ssh_user} 2>&1 | tee /tmp/vm-post-setup.log"
+
+    log_msg PHASE "Post-setup complete on '$name'"
+
+    # Auto-snapshot after successful provisioning
+    local snap_name="post-setup"
+    if virsh snapshot-info "$name" "$snap_name" &>/dev/null; then
+        snap_name="post-setup-$(date +%Y%m%d-%H%M%S)"
+    fi
+    log_msg INFO "Creating snapshot '$snap_name'..."
+    virsh snapshot-create-as "$name" \
+        --name "$snap_name" \
+        --description "Auto-snapshot after post-setup at $(date '+%Y-%m-%d %H:%M:%S')" \
+        --atomic
+    log_msg PHASE "Snapshot '$snap_name' created — rollback anytime with: $SCRIPT_NAME rollback $name $snap_name"
+}
+
+# --- Analyze (forensics wrapper) ---
+
+function cmd_analyze() {
+    if [[ $# -lt 1 ]]; then
+        die "Usage: $SCRIPT_NAME analyze <vm-name> [forensics-args...]"
+    fi
+
+    local name="$1"; shift
+    require_vm "$name"
+
+    local forensics_script
+    forensics_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vm-forensics.sh"
+    if [[ ! -f "$forensics_script" ]]; then
+        die "vm-forensics.sh not found in $(dirname "$forensics_script") — place it alongside kvm-manager.sh"
+    fi
+
+    exec bash "$forensics_script" "$name" "$@"
+}
+
+# --- Autostart ---
+
+function cmd_autostart() {
+    check_root
+    if [[ $# -lt 1 ]]; then
+        die "Usage: $SCRIPT_NAME autostart <vm-name> [on|off]"
+    fi
+
+    local name="$1"
+    local toggle="${2:-on}"
+    require_vm "$name"
+
+    case "$toggle" in
+        on)
+            virsh autostart "$name"
+            log_msg INFO "VM '$name' will start automatically on host boot"
+            ;;
+        off)
+            virsh autostart --disable "$name"
+            log_msg INFO "VM '$name' autostart disabled"
+            ;;
+        *)
+            die "Unknown toggle '$toggle' — use 'on' or 'off'"
+            ;;
+    esac
 }
 
 # --- Power Management ---
@@ -1222,6 +1461,7 @@ ${BOLD}VM LIFECYCLE${RESET}
         --cpu <N>                         vCPU count (default: $DEFAULT_CPU)
         --ram <size>                      RAM size, e.g. 2G, 512M (default: ${DEFAULT_RAM_MIB}M)
         --disk <size>                     Disk size, e.g. 20G, 1T (default: ${DEFAULT_DISK_GB}G)
+        --post-setup [path]               Run post-setup script on first boot (cloud-image only)
     delete <name> [--force]             Delete VM and all its storage
     list                                List all VMs with status
 
@@ -1242,6 +1482,11 @@ ${BOLD}ANTI-DETECTION${RESET} (malware analysis sandbox hardening)
         --verify                          Verify all hardening changes were applied
     create <name> --cloud-image --stealth  Create a pre-hardened VM in one step
 
+${BOLD}PROVISIONING${RESET}
+    post-setup <vm> [script-path]       Run post-setup script on existing VM via SSH
+                                        Default: vm-post-setup.sh (same directory as kvm-manager)
+    analyze <vm> [forensics-args...]    Run vm-forensics analysis on a VM
+
 ${BOLD}MONITORING & ACCESS${RESET}
     status <vm>                         Detailed VM information
     monitor                             Live overview of all VMs (watch mode)
@@ -1252,16 +1497,16 @@ ${BOLD}POWER${RESET}
     start <vm>                          Start a VM
     stop <vm> [--force]                 Graceful shutdown (--force to kill)
     restart <vm>                        Reboot a VM
+    autostart <vm> [on|off]             Toggle VM autostart on host boot (default: on)
 
-${BOLD}TESTING WORKFLOW EXAMPLE${RESET}
-    # 1. Create a VM from cloud image (fastest, no installer)
-    $SCRIPT_NAME create test-vm --cloud-image --cpu 2 --ram 4G
+${BOLD}WORKFLOW EXAMPLES${RESET}
+    # Create a fully provisioned stealth VM
+    $SCRIPT_NAME create test-vm --cloud-image --cpu 4 --ram 8G --stealth --post-setup
     $SCRIPT_NAME snap test-vm clean
 
-    # 2. Run your install script inside the VM, then roll back
+    # Run malware, analyze, then roll back
+    $SCRIPT_NAME analyze test-vm
     $SCRIPT_NAME rollback test-vm clean    # sub-second revert!
-
-    # 3. Repeat as many times as needed
 EOF
 }
 
@@ -1286,9 +1531,11 @@ function main() {
         harden)          require_deps virsh virt-xml sed ;;
         status)          require_deps virsh qemu-img ;;
         ssh)             require_deps virsh ssh ;;
+        post-setup)      require_deps virsh ssh scp ;;
+        analyze)         ;; # forensics script handles its own deps
         list|delete|template-create|template-list|\
         snap|rollback|snap-list|snap-delete|\
-        start|stop|restart|monitor|console)
+        start|stop|restart|monitor|console|autostart)
                          require_deps virsh ;;
     esac
 
@@ -1308,10 +1555,13 @@ function main() {
         monitor)         cmd_monitor "$@" ;;
         console)         cmd_console "$@" ;;
         ssh)             cmd_ssh "$@" ;;
+        post-setup)      cmd_post_setup "$@" ;;
+        analyze)         cmd_analyze "$@" ;;
         harden)          cmd_harden "$@" ;;
         start)           cmd_power start "$@" ;;
         stop)            cmd_power stop "$@" ;;
         restart)         cmd_power restart "$@" ;;
+        autostart)       cmd_autostart "$@" ;;
         help|--help|-h)  usage ;;
         *)               die "Unknown command: $cmd — run '$SCRIPT_NAME help' for usage" ;;
     esac
