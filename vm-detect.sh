@@ -1,30 +1,10 @@
 #!/usr/bin/env bash
 #
 # vm-detect.sh — Red-team VM/hypervisor detection and escape vector auditing
-#
 # Usage: vm-detect.sh [OPTIONS] [COMMAND]
-#
-# Commands:
-#   scan            Run all detection checks (default)
-#   quick           Fast checks only (no timing attacks, no ACPI)
-#   escape-audit    Detect hypervisor and report known escape CVEs
-#   benchmark       RDTSC timing attack with detailed statistics
-#
-# Options:
-#   -v, --verbose     Enable verbose/debug output
-#   -q, --quiet       Exit code only (0=physical, 1=VM detected)
-#       --json        Machine-readable JSON output
-#   -h, --help        Show this help message
-#       --version     Show version information
-#
-# Exit codes:
-#   0  No virtualization detected (physical hardware)
-#   1  Virtualization detected
-#   2  Error / usage
-#
-# Author:  Lukas / Script & Automation Engineer
-# Version: 1.0.0
-# Date:    2026-04-03
+# Run vm-detect.sh --help for full command list
+
+
 
 set -euo pipefail
 IFS=$'\n\t'
