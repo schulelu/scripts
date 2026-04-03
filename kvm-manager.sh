@@ -25,11 +25,11 @@ GPU_PCI_ADDRS=()   # Set by detect_nvidia_gpu()
 GPU_VFIO_IDS=""    # Set by detect_nvidia_gpu()
 
 # --- Anti-Detection Hardware Profiles ---
-# Format: manufacturer|product|bios_vendor|bios_version|mac_oui
+# Format: manufacturer|product|bios_vendor|bios_version|mac_oui|board_manufacturer|board_product|chassis_manufacturer|chassis_type|nic_model
 STEALTH_PROFILES=(
-    "Dell Inc.|OptiPlex 7090|Dell Inc.|2.20.0|D0:94:66"
-    "Lenovo|ThinkCentre M920q|Lenovo|M22KT55A|70:5A:0F"
-    "HP|ProDesk 400 G7|HP|S17 Ver. 02.05.00|3C:52:82"
+    "Dell Inc.|OptiPlex 7090|Dell Inc.|2.20.0|D0:94:66|Dell Inc.|0KWVT8|Dell Inc.|3|e1000e"
+    "Lenovo|ThinkCentre M920q|Lenovo|M22KT55A|70:5A:0F|Lenovo|312D|Lenovo|3|e1000e"
+    "HP|ProDesk 400 G7|HP|S17 Ver. 02.05.00|3C:52:82|HP|87D6|HP|3|e1000e"
 )
 
 # --- Color Output ---
@@ -710,6 +710,11 @@ function cmd_create() {
             ci_packages="packages:
   - qemu-guest-agent"
             ci_runcmd="  - systemctl enable --now qemu-guest-agent"
+        else
+            # In stealth mode: purge packages that leak VM identity
+            ci_runcmd="  - apt-get purge -y open-vm-tools open-vm-tools-desktop 2>/dev/null || true
+  - apt-get purge -y qemu-guest-agent 2>/dev/null || true
+  - rm -f /etc/vmware-tools 2>/dev/null || true"
         fi
 
         if [[ "$post_setup" == true && -n "$post_setup_script" ]]; then
@@ -781,6 +786,9 @@ CIEOF
         rm -rf "$ci_dir"
 
         if [[ "$stealth" == true ]]; then
+            # i440FX machine type: all PCI devices use Intel vendor IDs (0x8086)
+            # Q35 creates ~14 PCIe root ports with Red Hat vendor 0x1b36 — instant VM detection
+            # USB disabled: qemu-xhci also uses 0x1b36, headless VMs don't need USB
             virt-install \
                 --name "$name" \
                 --vcpus "$cpu" \
@@ -790,6 +798,8 @@ CIEOF
                 --os-variant ubuntu24.04 \
                 --network network=default \
                 --graphics none \
+                --machine pc \
+                --controller usb,model=none \
                 --import \
                 --noreboot \
                 --noautoconsole
@@ -1610,8 +1620,8 @@ function cmd_harden() {
     fi
 
     local profile="${STEALTH_PROFILES[$profile_idx]}"
-    local manufacturer product bios_vendor bios_version mac_oui
-    IFS='|' read -r manufacturer product bios_vendor bios_version mac_oui <<< "$profile"
+    local manufacturer product bios_vendor bios_version mac_oui board_manufacturer board_product chassis_manufacturer chassis_type nic_model
+    IFS='|' read -r manufacturer product bios_vendor bios_version mac_oui board_manufacturer board_product chassis_manufacturer chassis_type nic_model <<< "$profile"
 
     local serial
     serial=$(generate_serial)
@@ -1624,14 +1634,34 @@ function cmd_harden() {
     xml_file=$(mktemp)
     virsh dumpxml "$name" --inactive > "$xml_file"
 
-    # Add or update sysinfo block
-    if grep -q '<sysinfo' "$xml_file"; then
-        # Remove existing sysinfo block, we'll add a fresh one
-        sed -i '/<sysinfo/,/<\/sysinfo>/d' "$xml_file"
-    fi
+    # Build sysinfo block (types 0-3: BIOS, System, Baseboard, Chassis)
+    local sysinfo_block="  <sysinfo type=\"smbios\">
+    <bios>
+      <entry name=\"vendor\">${bios_vendor}</entry>
+      <entry name=\"version\">${bios_version}</entry>
+    </bios>
+    <system>
+      <entry name=\"manufacturer\">${manufacturer}</entry>
+      <entry name=\"product\">${product}</entry>
+      <entry name=\"serial\">${serial}</entry>
+    </system>
+    <baseBoard>
+      <entry name=\"manufacturer\">${board_manufacturer}</entry>
+      <entry name=\"product\">${board_product}</entry>
+    </baseBoard>
+    <chassis>
+      <entry name=\"manufacturer\">${chassis_manufacturer}</entry>
+      <entry name=\"type\">${chassis_type}</entry>
+    </chassis>
+  </sysinfo>"
 
-    # Insert sysinfo before </domain>
-    sed -i "s|</domain>|  <sysinfo type=\"smbios\">\n    <bios>\n      <entry name=\"vendor\">${bios_vendor}</entry>\n      <entry name=\"version\">${bios_version}</entry>\n    </bios>\n    <system>\n      <entry name=\"manufacturer\">${manufacturer}</entry>\n      <entry name=\"product\">${product}</entry>\n      <entry name=\"serial\">${serial}</entry>\n    </system>\n  </sysinfo>\n</domain>|" "$xml_file"
+    python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+xml = re.sub(r'<sysinfo[\s>].*?</sysinfo>\s*', '', xml, flags=re.DOTALL)
+xml = xml.replace('</domain>', sys.argv[2] + '\n</domain>')
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file" "$sysinfo_block"
 
     # Ensure <smbios mode="sysinfo"/> is in <os> block
     if ! grep -q 'smbios mode' "$xml_file"; then
@@ -1656,7 +1686,27 @@ function cmd_harden() {
         rm -f "$xml_file"
     }
 
-    # 3. MAC address randomization
+    # 3. CPU: host-passthrough with hypervisor + vmx features disabled
+    #    - hypervisor: hides CPUID bit 31 (the "I am a VM" flag in /proc/cpuinfo)
+    #    - vmx: prevents guest from seeing VMX and auto-loading kvm_intel module
+    log_msg INFO "Setting CPU mode to host-passthrough (hiding hypervisor+vmx)"
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    # Remove any existing CPU definition (multi-line block or self-closing)
+    # Use a python one-liner for reliable multi-line XML element removal
+    python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+xml = re.sub(r'<cpu[\s>].*?</cpu>\s*', '', xml, flags=re.DOTALL)
+xml = re.sub(r'<cpu\s[^>]*/>\s*', '', xml)
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file"
+    # Insert our CPU block before </domain>
+    sed -i 's|</domain>|  <cpu mode="host-passthrough" check="none">\n    <feature policy="disable" name="hypervisor"/>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n</domain>|' "$xml_file"
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 4. MAC address randomization
     local new_mac
     new_mac=$(generate_mac "$mac_oui")
     log_msg INFO "Setting MAC address: $new_mac ($manufacturer OUI)"
@@ -1664,7 +1714,58 @@ function cmd_harden() {
         log_msg WARN "Could not update MAC via virt-xml — update manually with 'virsh edit $name'"
     }
 
-    # 4. Disk bus: virtio -> sata
+    # 5. NIC model (e1000e looks like real Intel hardware, not virtio)
+    log_msg INFO "Setting NIC model to ${nic_model}"
+    virt-xml "$name" --edit --network model="${nic_model}" --define >/dev/null 2>&1 || {
+        xml_file=$(mktemp)
+        virsh dumpxml "$name" --inactive > "$xml_file"
+        sed -i "s|<model type='[^']*'/>|<model type='${nic_model}'/>|" "$xml_file"
+        virsh define "$xml_file" >/dev/null
+        rm -f "$xml_file"
+    }
+
+    # 6. Machine type: Q35 -> i440FX (eliminates all 0x1b36 Red Hat PCI vendor IDs)
+    #    Q35 creates ~14 PCIe root ports with hardcoded vendor 0x1b36 — instant VM detection.
+    #    i440FX uses flat PCI bus; all chipset devices have Intel vendor 0x8086.
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    if grep -q "q35" "$xml_file"; then
+        log_msg INFO "Converting machine type from Q35 to i440FX (eliminates Red Hat PCI 0x1b36)"
+        python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+
+# Change machine type to 'pc' (i440FX)
+xml = re.sub(r\"machine='[^']*'\", \"machine='pc'\", xml)
+
+# Remove all PCIe root port controllers (i440FX doesn't use PCIe)
+xml = re.sub(r\"<controller type='pci'[^>]*model='pcie-root-port'.*?</controller>\s*\", '', xml, flags=re.DOTALL)
+xml = re.sub(r\"<controller type='pci'[^>]*model='pcie-root-port'[^/]*/>\s*\", '', xml)
+
+# Replace pcie-root with pci-root (i440FX topology)
+xml = re.sub(r\"<controller type='pci'[^>]*model='pcie-root'.*?</controller>\s*\",
+             \"<controller type='pci' index='0' model='pci-root'/>\n    \", xml, flags=re.DOTALL)
+xml = re.sub(r\"<controller type='pci'[^>]*model='pcie-root'[^/]*/>\s*\",
+             \"<controller type='pci' index='0' model='pci-root'/>\n    \", xml)
+
+# Remove all PCI address assignments — libvirt will auto-assign for new topology
+xml = re.sub(r\"<address type='pci'[^/]*/>\s*\", '', xml)
+
+# Disable USB controller (qemu-xhci also uses vendor 0x1b36)
+xml = re.sub(r\"<controller type='usb'[^>]*>.*?</controller>\s*\",
+             \"<controller type='usb' model='none'/>\n    \", xml, flags=re.DOTALL)
+xml = re.sub(r\"<controller type='usb'[^/]*/>\",
+             \"<controller type='usb' model='none'/>\", xml)
+
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file"
+        virsh define "$xml_file" >/dev/null
+    else
+        log_msg INFO "Machine type already non-Q35, skipping conversion"
+    fi
+    rm -f "$xml_file"
+
+    # 7. Disk bus: virtio -> sata
     log_msg INFO "Changing disk bus to SATA"
     xml_file=$(mktemp)
     virsh dumpxml "$name" --inactive > "$xml_file"
@@ -1684,11 +1785,160 @@ function cmd_harden() {
     fi
     rm -f "$xml_file"
 
-    # 5. Remove QEMU guest agent channel
+    # 8. Remove QEMU guest agent + ALL virtio devices that leak hypervisor
     log_msg INFO "Removing QEMU guest agent channel"
-    virt-xml "$name" --remove-device --channel target.name=org.qemu.guest_agent.0 --define >/dev/null 2>&1 || {
-        log_msg INFO "No guest agent channel found (already removed or never added)"
-    }
+    virt-xml "$name" --remove-device --channel target.name=org.qemu.guest_agent.0 --define >/dev/null 2>&1 || true
+    log_msg INFO "Removing all virtio devices (balloon, console, serial, RNG — PCI 0x1af4 leaks)"
+    virt-xml "$name" --remove-device --channel target.type=virtio --define >/dev/null 2>&1 || true
+    virt-xml "$name" --remove-device --rng all --define >/dev/null 2>&1 || true
+    # Remove balloon + virtio-serial controllers via XML (virt-xml can't remove balloon reliably)
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+
+# Replace memballoon with model='none' (libvirt requires the element, but 'none' disables the PCI device)
+xml = re.sub(r'<memballoon[^>]*>.*?</memballoon>', '<memballoon model=\"none\"/>', xml, flags=re.DOTALL)
+xml = re.sub(r'<memballoon[^/]*/>', '<memballoon model=\"none\"/>', xml)
+
+# Remove virtio-serial controllers
+xml = re.sub(r'<controller type=.virtio-serial.*?</controller>\s*', '', xml, flags=re.DOTALL)
+xml = re.sub(r'<controller type=.virtio-serial[^/]*/>\s*', '', xml)
+
+# Remove virtio-RNG devices
+xml = re.sub(r'<rng\s+model=.virtio.*?</rng>\s*', '', xml, flags=re.DOTALL)
+
+# Note: The i440FX machine type conversion (step 6) eliminates PCIe root ports (vendor 0x1b36).
+# Any remaining virtio devices are caught here as cleanup.
+
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file"
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 9. Disk serial/model spoofing
+    log_msg INFO "Spoofing disk serial and model strings"
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    local disk_serial
+    disk_serial="WD-WCC$(head -c 100 /dev/urandom | tr -dc 'A-Z0-9' | head -c 10)"
+    # Add <serial> inside <disk> if not present
+    if grep -q "device='disk'" "$xml_file" && ! grep -A15 "device='disk'" "$xml_file" | grep -q '<serial>'; then
+        sed -i "/<disk type=.*device='disk'/,/<\/disk>/ {
+            /<target /a\\      <serial>${disk_serial}</serial>
+        }" "$xml_file"
+    fi
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 10. Timer/clock tuning (disable kvmclock and hypervclock)
+    log_msg INFO "Configuring stealthy clock sources"
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    local clock_block='  <clock offset="utc">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="pit" tickpolicy="delay"/>
+    <timer name="hpet" present="no"/>
+    <timer name="hypervclock" present="no"/>
+    <timer name="kvmclock" present="no"/>
+  </clock>'
+    python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+replacement = sys.argv[2]
+xml = re.sub(r'<clock[\s>].*?</clock>', replacement, xml, flags=re.DOTALL)
+if '<clock' not in xml:
+    xml = xml.replace('</domain>', replacement + '\n</domain>')
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file" "$clock_block"
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 11. Graphics/spice channel cleanup (remove hypervisor-specific devices)
+    log_msg INFO "Removing spice/VNC channels and virtual display devices"
+    virt-xml "$name" --remove-device --channel target.type=spicevmc --define >/dev/null 2>&1 || true
+    virt-xml "$name" --remove-device --sound all --define >/dev/null 2>&1 || true
+    virt-xml "$name" --remove-device --redirdev all --define >/dev/null 2>&1 || true
+    # Replace QXL (leaks hypervisor) with basic VGA
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+    if grep -q "model type='qxl'" "$xml_file"; then
+        sed -i "s|model type='qxl'|model type='vga'|g" "$xml_file"
+        virsh define "$xml_file" >/dev/null
+    fi
+    rm -f "$xml_file"
+
+    # 12. ACPI table OEM patching + disk model via QEMU namespace
+    #     Note: The i440FX conversion (step 6) already eliminated PCIe root port 0x1b36 devices.
+    #     This step patches ACPI OEM strings (removes BOCHS/BXPC) and disk model strings.
+    log_msg INFO "Patching ACPI OEM strings and disk model via QEMU namespace"
+    xml_file=$(mktemp)
+    virsh dumpxml "$name" --inactive > "$xml_file"
+
+    # Determine ACPI OEM strings based on manufacturer profile
+    local acpi_oem_id acpi_table_id
+    case "$manufacturer" in
+        *Dell*)   acpi_oem_id="DELL  "; acpi_table_id="DELLBIOS" ;;
+        *Lenovo*) acpi_oem_id="LENOVO"; acpi_table_id="TP-N2O  " ;;
+        *HP*)     acpi_oem_id="HP    "; acpi_table_id="HPBIOS  " ;;
+        *)        acpi_oem_id="DELL  "; acpi_table_id="DELLBIOS" ;;
+    esac
+
+    local qemu_block="  <qemu:commandline>
+    <qemu:arg value=\"-global\"/>
+    <qemu:arg value=\"ide-hd.model=WDC WD10EZEX-08WN4A0\"/>
+    <qemu:arg value=\"-global\"/>
+    <qemu:arg value=\"acpi-build.oem-id=${acpi_oem_id}\"/>
+    <qemu:arg value=\"-global\"/>
+    <qemu:arg value=\"acpi-build.oem-table-id=${acpi_table_id}\"/>
+  </qemu:commandline>"
+
+    python3 -c "
+import re, sys
+xml = open(sys.argv[1]).read()
+ns = 'xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\"'
+if 'xmlns:qemu' not in xml:
+    xml = xml.replace('<domain type', '<domain ' + ns + ' type')
+xml = re.sub(r'<qemu:commandline>.*?</qemu:commandline>\s*', '', xml, flags=re.DOTALL)
+xml = xml.replace('</domain>', sys.argv[2] + '\n</domain>')
+open(sys.argv[1], 'w').write(xml)
+" "$xml_file" "$qemu_block"
+    virsh define "$xml_file" >/dev/null
+    rm -f "$xml_file"
+
+    # 13. Randomize libvirt bridge MAC (default virbr0 uses QEMU OUI 52:54:00)
+    log_msg INFO "Checking default network bridge MAC"
+    local net_xml bridge_mac
+    net_xml=$(virsh net-dumpxml default 2>/dev/null || true)
+    bridge_mac=$(echo "$net_xml" | grep -oP "mac address='\K[^']+" || true)
+    if [[ "$bridge_mac" == 52:54:00* ]]; then
+        local new_bridge_mac
+        new_bridge_mac=$(generate_mac "$mac_oui")
+        log_msg INFO "Replacing default network bridge MAC ($bridge_mac -> $new_bridge_mac)"
+        local net_file
+        net_file=$(mktemp)
+        echo "$net_xml" > "$net_file"
+        sed -i "s|mac address='${bridge_mac}'|mac address='${new_bridge_mac}'|" "$net_file"
+        virsh net-destroy default >/dev/null 2>&1 || true
+        virsh net-define "$net_file" >/dev/null
+        virsh net-start default >/dev/null 2>&1 || true
+        rm -f "$net_file"
+    else
+        log_msg INFO "Bridge MAC already non-QEMU: ${bridge_mac:-none}"
+    fi
+
+    # 14. Note: open-vm-tools removal is handled via cloud-init runcmd during --stealth create
+    #     For existing VMs being hardened, remove via SSH if possible
+    local vm_ip
+    vm_ip=$(get_vm_ip "$name" 2>/dev/null || true)
+    if [[ -n "$vm_ip" ]]; then
+        log_msg INFO "Removing open-vm-tools from guest via SSH"
+        ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$KVM_SSH_KEY" \
+            "ubuntu@${vm_ip}" \
+            "sudo apt-get purge -y open-vm-tools open-vm-tools-desktop 2>/dev/null; sudo rm -rf /etc/vmware-tools 2>/dev/null" \
+            >/dev/null 2>&1 || log_msg WARN "Could not SSH to guest to remove open-vm-tools (run manually)"
+    fi
 
     # Verification
     if [[ "$verify" == true ]]; then
@@ -1742,6 +1992,76 @@ function cmd_harden() {
             log_msg WARN "  [FAIL] Guest agent channel still present"
         fi
 
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "mode=.host-passthrough." && echo "$xml" | grep -qi "feature.*policy=.disable.*name=.hypervisor."; then
+            log_msg INFO "  [PASS] CPU mode: host-passthrough (hypervisor+vmx hidden)"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] CPU mode not set or hypervisor feature not disabled"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -q "memballoon model='none'"; then
+            log_msg INFO "  [PASS] Virtio balloon: disabled"
+            passed=$((passed + 1))
+        elif ! echo "$xml" | grep -q "memballoon"; then
+            log_msg INFO "  [PASS] Virtio balloon: removed"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Virtio balloon still present"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "baseBoard"; then
+            log_msg INFO "  [PASS] Baseboard SMBIOS: spoofed"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Baseboard SMBIOS not set"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "model type=.${nic_model}."; then
+            log_msg INFO "  [PASS] NIC model: ${nic_model}"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] NIC model not set to ${nic_model}"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "kvmclock.*present=.no."; then
+            log_msg INFO "  [PASS] KVM clock: disabled"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] KVM clock not disabled"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi '<serial>'; then
+            log_msg INFO "  [PASS] Disk serial: spoofed"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Disk serial not set"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -qi "machine='pc'" || echo "$xml" | grep -qi "machine='pc-i440fx"; then
+            log_msg INFO "  [PASS] Machine type: i440FX (no Red Hat PCI devices)"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] Machine type is not i440FX (Q35 exposes Red Hat PCI 0x1b36)"
+        fi
+
+        checks=$((checks + 1))
+        if echo "$xml" | grep -q "controller type='usb' model='none'"; then
+            log_msg INFO "  [PASS] USB controller: disabled"
+            passed=$((passed + 1))
+        elif ! echo "$xml" | grep -q "controller type='usb'"; then
+            log_msg INFO "  [PASS] USB controller: removed"
+            passed=$((passed + 1))
+        else
+            log_msg WARN "  [FAIL] USB controller still present (qemu-xhci uses vendor 0x1b36)"
+        fi
+
         log_msg INFO "  Result: $passed/$checks checks passed"
     fi
 
@@ -1749,9 +2069,16 @@ function cmd_harden() {
     log_msg INFO "  Profile:    $manufacturer $product"
     log_msg INFO "  Serial:     $serial"
     log_msg INFO "  MAC:        $new_mac"
-    log_msg INFO "  Disk bus:   SATA"
+    log_msg INFO "  NIC model:  ${nic_model}"
+    log_msg INFO "  CPU mode:   host-passthrough (hypervisor+vmx hidden)"
+    log_msg INFO "  Machine:    i440FX (all PCI devices Intel 0x8086)"
+    log_msg INFO "  Disk bus:   SATA (serial spoofed)"
+    log_msg INFO "  Clocks:     kvmclock+hypervclock disabled"
+    log_msg INFO "  ACPI:       OEM strings patched"
+    log_msg INFO "  Graphics:   spice removed, VGA only"
+    log_msg INFO "  USB:        disabled (qemu-xhci uses vendor 0x1b36)"
     log_msg INFO "  Hypervisor: hidden"
-    log_msg WARN "Note: IP detection may be slower without guest agent"
+    log_msg WARN "Note: IP detection may be slower without guest agent; NIC is ${nic_model} (slower than virtio)"
 }
 
 # --- Usage ---

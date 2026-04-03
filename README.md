@@ -8,6 +8,7 @@ A collection of bash scripts for KVM virtual machine management, malware sandbox
 | `vm-forensics.sh` | Live traffic monitoring and post-analysis for KVM malware sandboxes |
 | `vm-post-setup.sh` | First-boot provisioning for Ubuntu cloud-image VMs (CLI tools, dev envs, web stack, security) |
 | `desktop-lag-doctor.sh` | Diagnose and fix micro-lags on Linux desktops |
+| `vm-detect.sh` | Red-team VM/hypervisor detection and escape vector auditing |
 | `gpu-detective.sh` | Detect, diagnose, and resolve undetected GPU issues on Ubuntu |
 
 ## Prerequisites
@@ -296,6 +297,83 @@ sudo ./vm-forensics.sh dump-mem sandbox
 - **Use `watch-all` for interactive sessions** — combines background pcap capture with live display. The pcap is saved even if you miss something in the live view.
 - **Run `disk-diff` after stopping the VM** — the VM must be shut off for disk comparison. Compare against your clean snapshot to see all filesystem changes.
 - **Session directories** are created under `./forensics/<vm-name>/<timestamp>/` — each capture gets its own timestamped directory.
+
+---
+
+## vm-detect.sh
+
+Red-team VM/hypervisor detection tool. Runs **inside a guest** to detect virtualization, identify the hypervisor type, report confidence scores, and audit known escape vectors. Use it to validate your stealth hardening setup.
+
+### Commands
+
+```
+scan            Run all 11 detection checks (default)
+quick           Fast checks only (skip timing, ACPI, network)
+escape-audit    Detect hypervisor + report known escape CVEs
+benchmark       RDTSC timing attack with detailed statistics
+```
+
+### Options
+
+```
+-v, --verbose     Enable verbose/debug output
+-q, --quiet       Exit code only (0=physical, 1=VM detected)
+    --json        Machine-readable JSON output
+```
+
+### Detection Categories
+
+| Check | Method | Signal |
+|-------|--------|--------|
+| **CPUID** | Hypervisor bit + vendor string (leaf 0x40000000) | High |
+| **DMI/SMBIOS** | `/sys/class/dmi/id/*` for QEMU/KVM/VBox/VMware strings | High |
+| **PCI Devices** | Virtual PCI vendor IDs (virtio 0x1af4, VMware 0x15ad, VBox 0x80ee) | High |
+| **Disk** | Disk model/vendor/serial + virtio block device names | Medium |
+| **Processes** | Guest agent processes (qemu-ga, VBoxService) + kernel modules | Medium |
+| **Filesystem** | `/sys/hypervisor`, `/dev/virtio-ports`, `qemu_fw_cfg`, etc. | Medium |
+| **Timing** | RDTSC: CPUID trap overhead vs NOP baseline (compiled C) | High |
+| **MAC Address** | OUI prefix matching against known virtual prefixes | Medium |
+| **CPU** | Model string anomalies, hypervisor flag, core count vs model | Medium |
+| **ACPI** | DSDT/FACP/DMI binary table signatures (BOCHS, BXPC, QEMU) | High |
+| **Network** | Gateway MAC, bridge interfaces, virbr detection | Low |
+
+### Escape Audit
+
+The `escape-audit` command identifies the hypervisor and reports known VM escape CVEs:
+
+- **QEMU/KVM**: VENOM (CVE-2015-3456), USB EHCI (CVE-2020-14364), virtio-net UAF (CVE-2021-3748), QCOW2 escape (CVE-2024-4467), and more
+- **VirtualBox**: 3D acceleration escape (CVE-2018-2698), VBoxSVGA heap overflow (CVE-2023-21987)
+- **VMware**: DnD heap overflow (CVE-2017-4901), USB EHCI (CVE-2022-31705)
+- **Hyper-V**: vmswitch RCE (CVE-2021-28476)
+
+### Usage
+
+```bash
+# Full scan inside a VM (needs root for ACPI tables)
+sudo ./vm-detect.sh scan
+
+# Quick check — just exit code
+./vm-detect.sh quick --quiet && echo "Physical" || echo "Virtual"
+
+# JSON output for automation
+sudo ./vm-detect.sh scan --json | jq .
+
+# Identify hypervisor and list escape CVEs
+sudo ./vm-detect.sh escape-audit
+
+# Test your stealth hardening
+sudo ./kvm-manager.sh create sandbox --cloud-image --stealth
+# Copy vm-detect.sh into the VM and run it
+sudo ./kvm-manager.sh ssh sandbox -- 'sudo bash /tmp/vm-detect.sh scan'
+```
+
+### Best Practices
+
+- **Run on unhardened VMs first** — establishes a baseline of what gets detected before hardening.
+- **Run after `kvm-manager.sh harden`** — validates that hardening actually reduced detection surface.
+- **Use `--json` for CI/automation** — parse results programmatically to gate deployments.
+- **ACPI checks need root** — the timing attack needs `gcc`. Install both for a complete scan.
+- **Escape CVEs are informational** — patched hypervisors may not be vulnerable. Always check your QEMU/libvirt version.
 
 ---
 
