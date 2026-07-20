@@ -162,26 +162,65 @@ function require_deps() {
 }
 
 # --- GPU Passthrough Helpers ---
+# GPU handling is vendor-agnostic at the VFIO level (NVIDIA / AMD / Intel).
+# PCI addresses use the short "NN:NN.N" form (domain 0000 assumed, as elsewhere).
 
-function detect_nvidia_gpu() {
-    # Detect NVIDIA GPU and all IOMMU group siblings for passthrough.
-    # Sets globals: GPU_PCI_ADDRS=() and GPU_VFIO_IDS=""
+function gpu_enumerate() {
+    # Echo one PCI head address (NN:NN.N) per GPU / display controller.
+    # Strip a leading 0000: domain (some lspci builds print domain-qualified BDFs);
+    # domain 0000 is assumed throughout, as elsewhere in this script.
+    lspci -nn 2>/dev/null \
+        | grep -iE 'VGA compatible controller|3D controller|Display controller' \
+        | awk '{print $1}' \
+        | sed 's/^0000://'
+}
+
+function gpu_is_primary() {
+    # True if this PCI address is the host's boot/primary GPU (boot_vga=1).
+    local f="/sys/bus/pci/devices/0000:${1}/boot_vga"
+    [[ -r "$f" && "$(cat "$f" 2>/dev/null)" == "1" ]]
+}
+
+function gpu_host_driver() {
+    # Echo the kernel driver bound to a PCI address, or "unbound".
+    local link="/sys/bus/pci/devices/0000:${1}/driver"
+    if [[ -L "$link" ]]; then
+        basename "$(readlink "$link")"
+    else
+        echo "unbound"
+    fi
+}
+
+function gpu_iommu_group() {
+    # Echo the IOMMU group number for a PCI address, or empty if unknown.
+    # Must return 0 even when absent — it is used in $() assignments under set -e.
+    local link="/sys/bus/pci/devices/0000:${1}/iommu_group"
+    [[ -e "$link" ]] && basename "$(readlink "$link")"
+    return 0
+}
+
+function gpu_vendor_name() {
+    # Map a GPU PCI address to a vendor keyword.
+    local vid
+    vid=$(lspci -n -s "$1" 2>/dev/null | awk '{print $3}' | cut -d: -f1)
+    case "$vid" in
+        10de) echo nvidia ;;
+        1002) echo amd ;;
+        8086) echo intel ;;
+        *)    echo unknown ;;
+    esac
+}
+
+function resolve_gpu_group() {
+    # For the GPU at PCI addr $1, populate GPU_PCI_ADDRS=() and GPU_VFIO_IDS
+    # with every non-bridge device in its IOMMU group (or same bus:slot
+    # functions pre-IOMMU). PCI bridges/root-ports are skipped — they must not
+    # be bound to vfio-pci or attached as host-devices.
+    local gpu_addr="$1"
     GPU_PCI_ADDRS=()
     GPU_VFIO_IDS=""
+    local gpu_slot="${gpu_addr%.*}"
 
-    local gpu_line
-    gpu_line=$(lspci -nn 2>/dev/null | grep -iE '\[10de:[0-9a-f]+\]' | grep -iE '(VGA|3D|Display)' | head -1) || true
-    if [[ -z "$gpu_line" ]]; then
-        return 1
-    fi
-
-    local gpu_addr
-    gpu_addr=$(echo "$gpu_line" | awk '{print $1}')
-    local gpu_slot="${gpu_addr%.*}"  # e.g. 01:00
-
-    log_msg INFO "Detected NVIDIA GPU at PCI ${gpu_addr}: $(echo "$gpu_line" | cut -d' ' -f2-)"
-
-    # Try IOMMU groups first (available after IOMMU is enabled)
     local iommu_group_dir=""
     if [[ -d /sys/kernel/iommu_groups ]]; then
         local group_path
@@ -193,83 +232,166 @@ function detect_nvidia_gpu() {
         done
     fi
 
-    local -a addrs=()
-    local -a ids=()
-
+    local -a addrs=() ids=()
+    local addr class id
     if [[ -n "$iommu_group_dir" ]]; then
-        # Use actual IOMMU group
         local dev
         for dev in "${iommu_group_dir}"/0000:*; do
             [[ -e "$dev" ]] || continue
-            local addr
             addr=$(basename "$dev" | sed 's/^0000://')
+            read -r class id < <(lspci -n -s "$addr" 2>/dev/null | awk '{print $2, $3}')
+            [[ "$class" == 06* ]] && continue   # skip PCI bridges / root ports
             addrs+=("$addr")
-            local dev_id
-            dev_id=$(lspci -n -s "$addr" 2>/dev/null | awk '{print $3}')
-            ids+=("$dev_id")
+            ids+=("$id")
         done
     else
-        # Fallback: scan all functions on same bus:slot (pre-IOMMU)
+        # Fallback: same bus:slot functions (pre-IOMMU)
         local line
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            local addr
             addr=$(echo "$line" | awk '{print $1}')
+            read -r class id < <(lspci -n -s "$addr" 2>/dev/null | awk '{print $2, $3}')
+            [[ "$class" == 06* ]] && continue
             addrs+=("$addr")
-            local dev_id
-            dev_id=$(lspci -n -s "$addr" 2>/dev/null | awk '{print $3}')
-            ids+=("$dev_id")
-        done < <(lspci -nn 2>/dev/null | grep "^${gpu_slot}\.")
+            ids+=("$id")
+        done < <(lspci -nn 2>/dev/null | grep -E "^(0000:)?${gpu_slot}\." | sed 's/^0000://')
     fi
 
-    if [[ ${#addrs[@]} -eq 0 ]]; then
-        return 1
-    fi
-
+    [[ ${#addrs[@]} -eq 0 ]] && return 1
     GPU_PCI_ADDRS=("${addrs[@]}")
     GPU_VFIO_IDS=$(IFS=,; echo "${ids[*]}")
-
-    local i
-    for i in "${!addrs[@]}"; do
-        local desc
-        desc=$(lspci -s "${addrs[$i]}" 2>/dev/null | cut -d' ' -f2-)
-        log_msg INFO "  IOMMU group device: ${addrs[$i]} [${ids[$i]}] — $desc"
-    done
-
     return 0
 }
 
-function check_vfio_ready() {
-    # Verify IOMMU is enabled and GPU is bound to vfio-pci
-    if ! grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
-        return 1
-    fi
+function gpu_hostdev_addrs() {
+    # Print host PCI addresses (NN:NN.N) of every PCI <hostdev> assigned to a VM.
+    # State-tracks the XML so only <source> addresses (host side) are printed.
+    virsh dumpxml "$1" 2>/dev/null | awk '
+        /<hostdev[^>]*type=.pci./ { inhd=1 }
+        /<\/hostdev>/            { inhd=0; insrc=0 }
+        inhd && /<source>/       { insrc=1 }
+        inhd && /<\/source>/     { insrc=0 }
+        inhd && insrc && /<address/ {
+            bus=slot=fn=""
+            if (match($0, /bus=.0x[0-9a-fA-F]+/))      { s=substr($0,RSTART,RLENGTH); sub(/.*0x/,"",s); bus=s }
+            if (match($0, /slot=.0x[0-9a-fA-F]+/))     { s=substr($0,RSTART,RLENGTH); sub(/.*0x/,"",s); slot=s }
+            if (match($0, /function=.0x[0-9a-fA-F]+/)) { s=substr($0,RSTART,RLENGTH); sub(/.*0x/,"",s); fn=s }
+            if (bus!="" && slot!="" && fn!="") printf "%s:%s.%s\n", bus, slot, fn
+        }'
+}
 
-    if [[ ${#GPU_PCI_ADDRS[@]} -eq 0 ]]; then
-        detect_nvidia_gpu || return 1
-    fi
+function gpu_assigned_vm() {
+    # Echo the first defined VM whose PCI host-devices include addr $1, else nothing.
+    local addr="$1" vm
+    while IFS= read -r vm; do
+        [[ -z "$vm" ]] && continue
+        if gpu_hostdev_addrs "$vm" | grep -qx "$addr"; then
+            echo "$vm"
+            return 0
+        fi
+    done < <(virsh list --all --name 2>/dev/null | grep -v '^$')
+    return 1
+}
 
-    local addr
-    for addr in "${GPU_PCI_ADDRS[@]}"; do
-        local driver_link="/sys/bus/pci/devices/0000:${addr}/driver"
-        if [[ -L "$driver_link" ]]; then
-            local current_driver
-            current_driver=$(basename "$(readlink "$driver_link")")
-            if [[ "$current_driver" != "vfio-pci" ]]; then
+function resolve_gpu_selector() {
+    # Map a selector (index, BDF, or comma-list) to GPU head PCI addresses.
+    # Echoes one addr per line on stdout. Returns 1 if any token is invalid.
+    local sel="$1"
+    local -a gpus=()
+    mapfile -t gpus < <(gpu_enumerate)
+    [[ ${#gpus[@]} -eq 0 ]] && { log_msg ERROR "No GPUs detected" >&2; return 1; }
+
+    local -a tokens=()
+    IFS=',' read -ra tokens <<< "$sel"
+    local token
+    for token in "${tokens[@]}"; do
+        token="${token// /}"
+        [[ -z "$token" ]] && continue
+        token="${token#0000:}"   # strip domain prefix if present
+        if [[ "$token" =~ ^[0-9]+$ ]]; then
+            if [[ "$token" -ge ${#gpus[@]} ]]; then
+                log_msg ERROR "GPU index $token out of range (0-$(( ${#gpus[@]} - 1 ))) — see 'gpu-list'" >&2
                 return 1
             fi
+            echo "${gpus[$token]}"
+        elif [[ "$token" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+            local found=false g
+            for g in "${gpus[@]}"; do
+                [[ "$g" == "$token" ]] && { found=true; break; }
+            done
+            [[ "$found" != true ]] && { log_msg ERROR "PCI address $token is not a GPU — see 'gpu-list'" >&2; return 1; }
+            echo "$token"
         else
+            log_msg ERROR "Invalid GPU selector '$token' — use an index, PCI address, or comma-list" >&2
             return 1
         fi
     done
+}
 
-    return 0
+function print_gpu_table() {
+    # The "nice selection": every GPU with index, driver, state and VM assignment.
+    local -a gpus=()
+    mapfile -t gpus < <(gpu_enumerate)
+    if [[ ${#gpus[@]} -eq 0 ]]; then
+        log_msg INFO "No GPUs / display controllers detected"
+        return
+    fi
+
+    printf "${BOLD}%-4s %-12s %-34s %-6s %-10s %-11s %s${RESET}\n" \
+        "IDX" "PCI" "MODEL" "GROUP" "DRIVER" "STATE" "ASSIGNED"
+    printf "%-4s %-12s %-34s %-6s %-10s %-11s %s\n" \
+        "----" "------------" "----------------------------------" "------" "----------" "-----------" "----------"
+
+    local i addr
+    for i in "${!gpus[@]}"; do
+        addr="${gpus[$i]}"
+        local model group driver state assigned c
+        model=$(lspci -s "$addr" 2>/dev/null | sed -E 's/^[^ ]+ [^:]+: //' | cut -c1-34)
+        group=$(gpu_iommu_group "$addr"); group="${group:--}"
+        driver=$(gpu_host_driver "$addr")
+        if gpu_is_primary "$addr"; then
+            state="primary"
+        elif [[ "$driver" == "vfio-pci" ]]; then
+            state="vfio-ready"
+        else
+            state="host"
+        fi
+        assigned=$(gpu_assigned_vm "$addr" || true); assigned="${assigned:-free}"
+        c="$RESET"
+        [[ "$state" == "vfio-ready" && "$assigned" == "free" ]] && c="$GREEN"
+        [[ "$state" == "primary" ]] && c="$YELLOW"
+        [[ "$assigned" != "free" ]] && c="$CYAN"
+        printf "%-4s %-12s %-34s %-6s %-10s ${c}%-11s${RESET} %s\n" \
+            "$i" "$addr" "$model" "$group" "$driver" "$state" "$assigned"
+    done
+}
+
+function check_vfio_ready() {
+    # True if IOMMU is enabled and at least one non-primary GPU is bound to vfio-pci.
+    grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null || return 1
+
+    local addr
+    while IFS= read -r addr; do
+        [[ -z "$addr" ]] && continue
+        gpu_is_primary "$addr" && continue
+        [[ "$(gpu_host_driver "$addr")" == "vfio-pci" ]] && return 0
+    done < <(gpu_enumerate)
+    return 1
 }
 
 function pci_to_virsh_hostdev() {
     # Convert PCI address "01:00.0" to virsh format "pci_0000_01_00_0"
     local addr="$1"
     echo "pci_0000_${addr//:/_}" | sed 's/\./_/g'
+}
+
+function attach_gpu_hostdevs() {
+    # Attach every PCI addr in GPU_PCI_ADDRS to VM $1 as a persistent host-device.
+    local vm="$1" addr
+    for addr in "${GPU_PCI_ADDRS[@]}"; do
+        virt-xml "$vm" --add-device --host-device "$(pci_to_virsh_hostdev "$addr")" --define >/dev/null \
+            || die "Failed to attach GPU device $addr to '$vm'"
+    done
 }
 
 function get_kvm_ssh_key_path() {
@@ -430,10 +552,50 @@ function cmd_setup() {
     # --- GPU Passthrough (VFIO) Setup ---
     log_msg PHASE "Configuring GPU passthrough..."
 
-    if ! detect_nvidia_gpu; then
-        log_msg INFO "No NVIDIA GPU detected — skipping GPU passthrough setup"
+    local -a all_gpus=()
+    mapfile -t all_gpus < <(gpu_enumerate)
+    if [[ ${#all_gpus[@]} -eq 0 ]]; then
+        log_msg INFO "No GPU / display controller detected — skipping GPU passthrough setup"
         return 0
     fi
+
+    # Bind every GPU EXCEPT the host's primary (boot_vga) one to vfio-pci.
+    local -a bind_gpus=() bind_drivers=()
+    local g primary="" reserved_driver=""
+    for g in "${all_gpus[@]}"; do
+        if gpu_is_primary "$g"; then
+            primary="$g"
+            reserved_driver=$(gpu_host_driver "$g")
+            log_msg INFO "Reserving primary GPU $g ($(lspci -s "$g" 2>/dev/null | sed 's/^[^ ]* //')) for the host"
+        else
+            bind_gpus+=("$g")
+        fi
+    done
+
+    if [[ ${#bind_gpus[@]} -eq 0 ]]; then
+        if [[ -n "$primary" ]]; then
+            log_msg WARN "Only the primary GPU is present — nothing to pass through (the host needs it)"
+            log_msg PHASE "Setup complete"
+            return 0
+        fi
+        log_msg WARN "No primary (boot_vga) GPU detected — binding ALL GPUs to vfio-pci"
+        bind_gpus=("${all_gpus[@]}")
+    fi
+
+    # Collect vendor:device IDs + IOMMU siblings of every GPU to bind.
+    local -a bind_ids=()
+    for g in "${bind_gpus[@]}"; do
+        local d
+        d=$(gpu_host_driver "$g")
+        [[ "$d" != "unbound" && "$d" != "vfio-pci" ]] && bind_drivers+=("$d")
+        resolve_gpu_group "$g" || continue
+        local id
+        IFS=',' read -ra _ids <<< "$GPU_VFIO_IDS"
+        for id in "${_ids[@]}"; do bind_ids+=("$id"); done
+        log_msg INFO "Will bind GPU $g group [${GPU_VFIO_IDS}] to vfio-pci"
+    done
+    GPU_VFIO_IDS=$(printf '%s\n' "${bind_ids[@]}" | awk 'NF && !seen[$0]++' | paste -sd,)
+    GPU_PCI_ADDRS=("${bind_gpus[@]}")   # used only for the reboot summary below
 
     local NEEDS_REBOOT=false
 
@@ -461,18 +623,25 @@ function cmd_setup() {
         fi
     fi
 
-    # 2. Configure VFIO to claim GPU at boot
+    # 2. Configure VFIO to claim the selected GPUs at boot.
+    #    Bind by vendor:device ID. softdep pre-empts each GPU driver EXCEPT the one
+    #    serving the reserved primary GPU (so an iGPU on the same driver still loads).
+    #    ponytail: two identical-model GPUs share one vendor:device ID, so ids= binds
+    #    BOTH. To keep one for the host, pin it with a per-address driver_override in a
+    #    boot script instead — not handled here.
     log_msg INFO "Writing VFIO modprobe configuration..."
-    cat > "$VFIO_CONF" <<VFIOEOF
-# GPU passthrough — generated by $SCRIPT_NAME
-# Devices: ${GPU_PCI_ADDRS[*]}
-options vfio-pci ids=${GPU_VFIO_IDS}
-softdep nvidia pre: vfio-pci
-softdep nvidia_drm pre: vfio-pci
-softdep nvidia_uvm pre: vfio-pci
-softdep nvidia_modeset pre: vfio-pci
-softdep nouveau pre: vfio-pci
-VFIOEOF
+    {
+        echo "# GPU passthrough — generated by $SCRIPT_NAME"
+        echo "# Bound to vfio-pci: ${GPU_PCI_ADDRS[*]}"
+        [[ -n "$primary" ]] && echo "# Primary GPU reserved for host: $primary (driver: ${reserved_driver:-none})"
+        echo "options vfio-pci ids=${GPU_VFIO_IDS}"
+        local drv
+        for drv in $(printf '%s\n' "${bind_drivers[@]}" nvidia nvidia_drm nvidia_uvm nvidia_modeset nouveau amdgpu radeon \
+                     | awk 'NF && !seen[$0]++'); do
+            [[ "$drv" == "$reserved_driver" ]] && continue
+            echo "softdep $drv pre: vfio-pci"
+        done
+    } > "$VFIO_CONF"
     log_msg INFO "Written $VFIO_CONF (IDs: ${GPU_VFIO_IDS})"
 
     # 3. Load VFIO modules early via initramfs
@@ -493,7 +662,7 @@ MODEOF
         log_msg WARN "════════════════════════════════════════════"
         log_msg WARN "  REBOOT REQUIRED for GPU passthrough"
         log_msg WARN "  IOMMU + VFIO configuration written."
-        log_msg WARN "  After reboot, the NVIDIA GPU will be"
+        log_msg WARN "  After reboot, the selected GPU(s) will be"
         log_msg WARN "  bound to vfio-pci and available for VMs."
         log_msg WARN "════════════════════════════════════════════"
         log_msg INFO "After reboot, verify with: $SCRIPT_NAME gpu-status"
@@ -521,7 +690,7 @@ function cmd_create() {
     fi
 
     local template="" iso="" cloud_image=false stealth=false gpu=false cpu=$DEFAULT_CPU ram_mib=$DEFAULT_RAM_MIB disk_gb=$DEFAULT_DISK_GB
-    local post_setup="" post_setup_script=""
+    local post_setup="" post_setup_script="" gpu_selector="" gpu_vendor=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -529,7 +698,15 @@ function cmd_create() {
             --iso)         iso="$2"; shift 2 ;;
             --cloud-image) cloud_image=true; shift ;;
             --stealth)     stealth=true; shift ;;
-            --gpu)         gpu=true; shift ;;
+            --gpu)
+                gpu=true
+                # Optional selector (index / PCI addr / comma-list) unless next arg is a flag
+                if [[ $# -ge 2 && "${2:0:2}" != "--" ]]; then
+                    gpu_selector="$2"; shift 2
+                else
+                    shift
+                fi
+                ;;
             --post-setup)
                 post_setup=true
                 # Next arg is optional path (if it doesn't start with --)
@@ -570,7 +747,7 @@ function cmd_create() {
         die "Cannot combine --template, --iso, and --cloud-image"
     fi
 
-    # GPU passthrough validation
+    # GPU passthrough validation + selection
     if [[ "$gpu" == true ]]; then
         if [[ "$stealth" == true ]]; then
             die "Cannot combine --gpu with --stealth (GPU passthrough exposes real hardware)"
@@ -578,7 +755,41 @@ function cmd_create() {
         if ! check_vfio_ready; then
             die "GPU passthrough not ready — run '$SCRIPT_NAME setup' and reboot first (check with '$SCRIPT_NAME gpu-status')"
         fi
-        detect_nvidia_gpu || die "No NVIDIA GPU detected for passthrough"
+
+        # Resolve which GPU head(s) to pass through.
+        local -a gpu_heads=()
+        if [[ -z "$gpu_selector" ]]; then
+            # Default: first free, vfio-bound, non-primary GPU.
+            local g
+            while IFS= read -r g; do
+                [[ -z "$g" ]] && continue
+                gpu_is_primary "$g" && continue
+                [[ "$(gpu_host_driver "$g")" != "vfio-pci" ]] && continue
+                [[ -n "$(gpu_assigned_vm "$g")" ]] && continue
+                gpu_heads=("$g"); break
+            done < <(gpu_enumerate)
+            [[ ${#gpu_heads[@]} -eq 0 ]] && die "No free vfio-bound GPU available — see '$SCRIPT_NAME gpu-list'"
+        else
+            mapfile -t gpu_heads < <(resolve_gpu_selector "$gpu_selector") \
+                || die "Invalid --gpu selector: $gpu_selector"
+            [[ ${#gpu_heads[@]} -eq 0 ]] && die "Invalid --gpu selector: $gpu_selector"
+        fi
+
+        # Validate each and build the deduplicated union of their IOMMU groups.
+        local -a all_addrs=() head
+        for head in "${gpu_heads[@]}"; do
+            if [[ "$(gpu_host_driver "$head")" != "vfio-pci" ]]; then
+                die "GPU $head is not bound to vfio-pci — run '$SCRIPT_NAME setup' (check '$SCRIPT_NAME gpu-list')"
+            fi
+            local other
+            other=$(gpu_assigned_vm "$head" || true)
+            [[ -n "$other" ]] && log_msg WARN "GPU $head is already assigned to VM '$other' — they cannot run simultaneously"
+            resolve_gpu_group "$head" || die "Could not resolve IOMMU group for GPU $head"
+            all_addrs+=("${GPU_PCI_ADDRS[@]}")
+        done
+        mapfile -t GPU_PCI_ADDRS < <(printf '%s\n' "${all_addrs[@]}" | awk 'NF && !seen[$0]++')
+        gpu_vendor=$(gpu_vendor_name "${gpu_heads[0]}")
+
         if [[ $ram_mib -lt 8192 ]]; then
             log_msg WARN "GPU workloads typically need ≥8G RAM (current: ${ram_mib}M)"
         fi
@@ -615,6 +826,15 @@ function cmd_create() {
         if [[ $ram_mib -ne $DEFAULT_RAM_MIB ]]; then
             virsh setmaxmem "$name" "${ram_mib}M" --config
             virsh setmem "$name" "${ram_mib}M" --config
+        fi
+
+        # Attach GPU passthrough device(s) to the clone (templates carry none)
+        if [[ "$gpu" == true ]]; then
+            local clone_mtype
+            clone_mtype=$(virsh dumpxml "$name" 2>/dev/null | grep -oP "machine='\K[^']+" | head -1)
+            [[ "$clone_mtype" != *q35* ]] && log_msg WARN "Cloned VM machine type is '${clone_mtype:-unknown}' — GPU passthrough works best with q35"
+            log_msg INFO "Attaching GPU passthrough device(s) to '$name'..."
+            attach_gpu_hostdevs "$name"
         fi
 
     elif [[ -n "$iso" ]]; then
@@ -745,7 +965,7 @@ function cmd_create() {
     permissions: '0644'
     content: |
       GPU_PCI_ADDRESSES=\"${GPU_PCI_ADDRS[*]}\"
-      GPU_VENDOR=nvidia"
+      GPU_VENDOR=${gpu_vendor:-unknown}"
             if [[ -n "$ci_write_files" ]]; then
                 ci_write_files="${ci_write_files}
 ${gpu_marker}"
@@ -1488,32 +1708,14 @@ function cmd_gpu_status() {
         log_msg WARN "IOMMU groups:   ${RED}none${RESET} (IOMMU not active — reboot needed after setup)"
     fi
 
-    # GPU detection
-    if detect_nvidia_gpu; then
-        local addr
-        for addr in "${GPU_PCI_ADDRS[@]}"; do
-            local driver_link="/sys/bus/pci/devices/0000:${addr}/driver"
-            local current_driver="unbound"
-            if [[ -L "$driver_link" ]]; then
-                current_driver=$(basename "$(readlink "$driver_link")")
-            fi
-            local desc
-            desc=$(lspci -s "$addr" 2>/dev/null | cut -d' ' -f2-)
-            if [[ "$current_driver" == "vfio-pci" ]]; then
-                log_msg INFO "  ${addr}:  ${GREEN}vfio-pci${RESET} — $desc"
-            else
-                log_msg WARN "  ${addr}:  ${YELLOW}${current_driver}${RESET} — $desc"
-            fi
-        done
-        log_msg INFO "VFIO IDs:       ${GPU_VFIO_IDS}"
-    else
-        log_msg WARN "No NVIDIA GPU detected"
-    fi
+    # Per-GPU table (index, driver, state, VM assignment)
+    echo ""
+    print_gpu_table
 
     # Overall readiness
     echo ""
     if check_vfio_ready; then
-        log_msg PHASE "${GREEN}GPU passthrough is READY${RESET} — use '--gpu' when creating VMs"
+        log_msg PHASE "${GREEN}GPU passthrough is READY${RESET} — use '--gpu [selector]' when creating VMs"
     else
         log_msg WARN "GPU passthrough is NOT ready"
         if ! grep -qE '(intel|amd)_iommu=on' /proc/cmdline 2>/dev/null; then
@@ -1522,10 +1724,100 @@ function cmd_gpu_status() {
         elif [[ $group_count -eq 0 ]]; then
             log_msg INFO "  → Reboot the host to activate IOMMU"
         else
-            log_msg INFO "  → GPU is not bound to vfio-pci — check $VFIO_CONF"
+            log_msg INFO "  → No non-primary GPU is bound to vfio-pci — check $VFIO_CONF and reboot"
         fi
     fi
     echo ""
+}
+
+function cmd_gpu_list() {
+    log_msg PHASE "GPUs on this host"
+    echo ""
+    print_gpu_table
+    echo ""
+    log_msg INFO "Assign with: $SCRIPT_NAME create <vm> --cloud-image --gpu <IDX|PCI>"
+    log_msg INFO "         or: $SCRIPT_NAME gpu-attach <vm> <IDX|PCI>"
+}
+
+function cmd_gpu_attach() {
+    check_root
+    if [[ $# -lt 2 ]]; then
+        die "Usage: $SCRIPT_NAME gpu-attach <vm-name> <selector>"
+    fi
+
+    local name="$1" selector="$2"
+    require_vm "$name"
+
+    local state
+    state=$(get_vm_state "$name")
+    if [[ "$state" != "shut off" ]]; then
+        die "VM '$name' must be shut off to attach a GPU (current state: $state)"
+    fi
+
+    local -a heads=()
+    mapfile -t heads < <(resolve_gpu_selector "$selector") || die "Invalid selector: $selector"
+    [[ ${#heads[@]} -eq 0 ]] && die "Invalid selector: $selector"
+
+    local mtype
+    mtype=$(virsh dumpxml "$name" 2>/dev/null | grep -oP "machine='\K[^']+" | head -1)
+    [[ "$mtype" != *q35* ]] && log_msg WARN "VM machine type is '${mtype:-unknown}' — GPU passthrough works best with q35"
+
+    log_msg PHASE "Attaching GPU(s) to '$name'"
+    local head
+    for head in "${heads[@]}"; do
+        [[ "$(gpu_host_driver "$head")" != "vfio-pci" ]] && \
+            log_msg WARN "GPU $head is not bound to vfio-pci — VM may fail to start (run '$SCRIPT_NAME setup')"
+        local other
+        other=$(gpu_assigned_vm "$head" || true)
+        if [[ -n "$other" && "$other" != "$name" ]]; then
+            die "GPU $head is already assigned to VM '$other' — detach it there first"
+        fi
+        if [[ "$other" == "$name" ]]; then
+            log_msg WARN "GPU $head already attached to '$name' — skipping"
+            continue
+        fi
+        resolve_gpu_group "$head" || die "Could not resolve IOMMU group for GPU $head"
+        attach_gpu_hostdevs "$name"
+        log_msg INFO "Attached GPU $head (group: ${GPU_PCI_ADDRS[*]}) to '$name'"
+    done
+    log_msg PHASE "Done — start it with '$SCRIPT_NAME start $name'"
+}
+
+function cmd_gpu_detach() {
+    check_root
+    if [[ $# -lt 2 ]]; then
+        die "Usage: $SCRIPT_NAME gpu-detach <vm-name> <selector>"
+    fi
+
+    local name="$1" selector="$2"
+    require_vm "$name"
+
+    local state
+    state=$(get_vm_state "$name")
+    if [[ "$state" != "shut off" ]]; then
+        die "VM '$name' must be shut off to detach a GPU (current state: $state)"
+    fi
+
+    local -a heads=()
+    mapfile -t heads < <(resolve_gpu_selector "$selector") || die "Invalid selector: $selector"
+    [[ ${#heads[@]} -eq 0 ]] && die "Invalid selector: $selector"
+
+    log_msg PHASE "Detaching GPU(s) from '$name'"
+    local head removed=0
+    for head in "${heads[@]}"; do
+        resolve_gpu_group "$head" || die "Could not resolve IOMMU group for GPU $head"
+        local addr
+        for addr in "${GPU_PCI_ADDRS[@]}"; do
+            if virt-xml "$name" --remove-device --host-device "$(pci_to_virsh_hostdev "$addr")" --define >/dev/null 2>&1; then
+                removed=$((removed + 1))
+            fi
+        done
+        log_msg INFO "Detached GPU $head from '$name'"
+    done
+    if [[ $removed -eq 0 ]]; then
+        log_msg WARN "No matching GPU host-devices were attached to '$name'"
+    fi
+    log_msg PHASE "GPU detach complete for '$name'"
 }
 
 # --- Power Management ---
@@ -1907,25 +2199,40 @@ open(sys.argv[1], 'w').write(xml)
     virsh define "$xml_file" >/dev/null
     rm -f "$xml_file"
 
-    # 13. Randomize libvirt bridge MAC (default virbr0 uses QEMU OUI 52:54:00)
+    # 13. Randomize libvirt bridge MAC (default virbr0 uses QEMU OUI 52:54:00, an
+    #     in-guest detection vector via the gateway's ARP entry). Rewriting the
+    #     'default' network bounces it, so only do it when no OTHER VM is running on
+    #     it — otherwise we would drop those VMs' connectivity.
     log_msg INFO "Checking default network bridge MAC"
-    local net_xml bridge_mac
-    net_xml=$(virsh net-dumpxml default 2>/dev/null || true)
-    bridge_mac=$(echo "$net_xml" | grep -oP "mac address='\K[^']+" || true)
-    if [[ "$bridge_mac" == 52:54:00* ]]; then
-        local new_bridge_mac
-        new_bridge_mac=$(generate_mac "$mac_oui")
-        log_msg INFO "Replacing default network bridge MAC ($bridge_mac -> $new_bridge_mac)"
-        local net_file
-        net_file=$(mktemp)
-        echo "$net_xml" > "$net_file"
-        sed -i "s|mac address='${bridge_mac}'|mac address='${new_bridge_mac}'|" "$net_file"
-        virsh net-destroy default >/dev/null 2>&1 || true
-        virsh net-define "$net_file" >/dev/null
-        virsh net-start default >/dev/null 2>&1 || true
-        rm -f "$net_file"
+    local other_on_default=false vm_iter
+    while IFS= read -r vm_iter; do
+        [[ -z "$vm_iter" || "$vm_iter" == "$name" ]] && continue
+        if virsh domiflist "$vm_iter" 2>/dev/null | awk '{print $3}' | grep -qx default; then
+            other_on_default=true; break
+        fi
+    done < <(virsh list --state-running --name 2>/dev/null | grep -v '^$')
+
+    if [[ "$other_on_default" == true ]]; then
+        log_msg WARN "Other VMs are running on the 'default' network — skipping bridge-MAC rewrite to avoid disrupting them"
     else
-        log_msg INFO "Bridge MAC already non-QEMU: ${bridge_mac:-none}"
+        local net_xml bridge_mac
+        net_xml=$(virsh net-dumpxml default 2>/dev/null || true)
+        bridge_mac=$(echo "$net_xml" | grep -oP "mac address='\K[^']+" || true)
+        if [[ "$bridge_mac" == 52:54:00* ]]; then
+            local new_bridge_mac
+            new_bridge_mac=$(generate_mac "$mac_oui")
+            log_msg INFO "Replacing default network bridge MAC ($bridge_mac -> $new_bridge_mac)"
+            local net_file
+            net_file=$(mktemp)
+            echo "$net_xml" > "$net_file"
+            sed -i "s|mac address='${bridge_mac}'|mac address='${new_bridge_mac}'|" "$net_file"
+            virsh net-destroy default >/dev/null 2>&1 || true
+            virsh net-define "$net_file" >/dev/null
+            virsh net-start default >/dev/null 2>&1 || true
+            rm -f "$net_file"
+        else
+            log_msg INFO "Bridge MAC already non-QEMU: ${bridge_mac:-none}"
+        fi
     fi
 
     # 14. Note: open-vm-tools removal is handled via cloud-init runcmd during --stealth create
@@ -2101,7 +2408,9 @@ ${BOLD}VM LIFECYCLE${RESET}
         --cpu <N>                         vCPU count (default: $DEFAULT_CPU)
         --ram <size>                      RAM size, e.g. 2G, 512M (default: ${DEFAULT_RAM_MIB}M)
         --disk <size>                     Disk size, e.g. 20G, 1T (default: ${DEFAULT_DISK_GB}G)
-        --gpu                             Pass through host NVIDIA GPU (VFIO, requires setup first)
+        --gpu [selector]                  Pass through a host GPU via VFIO (requires setup first).
+                                          selector = GPU index, PCI addr, or comma-list (see gpu-list);
+                                          omit to pick the first free GPU. Repeatable devices per VM.
         --post-setup [path]               Run post-setup script on first boot (cloud-image only)
     delete <name> [--force]             Delete VM and all its storage
     list                                List all VMs with status
@@ -2128,8 +2437,11 @@ ${BOLD}PROVISIONING${RESET}
                                         Default: vm-post-setup.sh (same directory as kvm-manager)
     analyze <vm> [forensics-args...]    Run vm-forensics analysis on a VM
 
-${BOLD}GPU PASSTHROUGH${RESET} (for LLM/CUDA workloads)
+${BOLD}GPU PASSTHROUGH${RESET} (dedicate host GPUs to VMs — NVIDIA / AMD / Intel)
     gpu-status                          Check GPU passthrough readiness (IOMMU, VFIO, driver)
+    gpu-list                            List all GPUs with index, driver, and free/assigned state
+    gpu-attach <vm> <selector>          Dedicate GPU(s) to a shut-off VM (index / PCI / comma-list)
+    gpu-detach <vm> <selector>          Remove GPU(s) from a shut-off VM
 
 ${BOLD}MONITORING & ACCESS${RESET}
     status <vm>                         Detailed VM information
@@ -2153,9 +2465,14 @@ ${BOLD}WORKFLOW EXAMPLES${RESET}
     $SCRIPT_NAME rollback test-vm clean    # sub-second revert!
 
     # GPU passthrough for LLM workloads (first-time: setup + reboot)
-    $SCRIPT_NAME setup                     # configures IOMMU + VFIO
-    $SCRIPT_NAME gpu-status                # verify after reboot
-    $SCRIPT_NAME create llm-vm --cloud-image --cpu 8 --ram 32G --disk 100G --gpu --post-setup
+    $SCRIPT_NAME setup                     # binds non-primary GPUs to VFIO
+    $SCRIPT_NAME gpu-list                  # after reboot: see which GPUs are free
+    $SCRIPT_NAME create llm-vm --cloud-image --cpu 8 --ram 32G --disk 100G --gpu 0 --post-setup
+
+    # Multi-GPU host: give GPU 1 to one VM, and GPUs 2+3 to another
+    $SCRIPT_NAME create vm-a --cloud-image --ram 16G --gpu 1
+    $SCRIPT_NAME create vm-b --cloud-image --ram 32G --gpu 2,3
+    $SCRIPT_NAME gpu-attach vm-a 1         # or attach/detach on an existing shut-off VM
 EOF
 }
 
@@ -2174,10 +2491,11 @@ function main() {
 
     # Dependency pre-check (skip for setup/help)
     case "$cmd" in
-        setup|help|--help|-h|gpu-status) ;;
-        create)          require_deps virsh virt-install virt-clone qemu-img wget cloud-localds ;;
+        setup|help|--help|-h|gpu-status|gpu-list) ;;
+        create)          require_deps virsh virt-install virt-clone qemu-img wget cloud-localds base64 ;;
         clone)           require_deps virsh virt-clone ;;
-        harden)          require_deps virsh virt-xml sed ;;
+        harden)          require_deps virsh virt-xml sed python3 ;;
+        gpu-attach|gpu-detach) require_deps virsh virt-xml ;;
         status)          require_deps virsh qemu-img ;;
         ssh)             require_deps virsh ssh ;;
         post-setup)      require_deps virsh ssh scp ;;
@@ -2208,6 +2526,9 @@ function main() {
         analyze)         cmd_analyze "$@" ;;
         harden)          cmd_harden "$@" ;;
         gpu-status)      cmd_gpu_status "$@" ;;
+        gpu-list)        cmd_gpu_list "$@" ;;
+        gpu-attach)      cmd_gpu_attach "$@" ;;
+        gpu-detach)      cmd_gpu_detach "$@" ;;
         start)           cmd_power start "$@" ;;
         stop)            cmd_power stop "$@" ;;
         restart)         cmd_power restart "$@" ;;
@@ -2217,4 +2538,7 @@ function main() {
     esac
 }
 
-main "$@"
+# Only run main when executed directly, not when sourced (e.g. by test_kvm_manager.sh)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

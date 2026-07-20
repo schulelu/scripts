@@ -23,7 +23,7 @@ Install all KVM dependencies automatically:
 sudo ./kvm-manager.sh setup
 ```
 
-This installs `qemu-kvm`, `libvirt`, `virtinst`, `qemu-utils`, `cloud-image-utils`, enables the libvirt daemon, configures the default network, and optionally sets up NVIDIA GPU passthrough (IOMMU + VFIO).
+This installs `qemu-kvm`, `libvirt`, `virtinst`, `qemu-utils`, `cloud-image-utils`, enables the libvirt daemon, configures the default network, and optionally sets up GPU passthrough (IOMMU + VFIO) by binding every non-primary GPU — NVIDIA, AMD, or Intel — to `vfio-pci`.
 
 For forensics features, you also need `tcpdump` and `tshark`:
 
@@ -65,7 +65,9 @@ create <name> [options]       Create a new VM
   --ram <size>                  RAM size, e.g. 2G, 512M (default: 2048M)
   --disk <size>                 Disk size, e.g. 20G, 1T (default: 20G)
   --stealth                     Apply anti-detection hardening (malware analysis)
-  --gpu                         Pass through host NVIDIA GPU (requires setup first)
+  --gpu [selector]              Pass through host GPU(s) via VFIO (requires setup first).
+                                selector = index, PCI addr, or comma-list (see gpu-list);
+                                omit to pick the first free GPU
   --post-setup [path]           Run post-setup script after first boot
 delete <name> [--force]       Delete VM and all its storage
 list                          List all VMs with status
@@ -102,9 +104,27 @@ Stealth mode spoofs SMBIOS (manufacturer, product, BIOS), generates realistic se
 
 ```
 gpu-status                    Check GPU passthrough readiness (IOMMU, VFIO, driver)
+gpu-list                      List all GPUs with index, driver, and free/assigned state
+gpu-attach <vm> <selector>    Dedicate GPU(s) to a shut-off VM (index / PCI / comma-list)
+gpu-detach <vm> <selector>    Remove GPU(s) from a shut-off VM
 ```
 
-Configured automatically during `setup` if an NVIDIA GPU is detected. Requires a reboot after initial setup.
+Detection is vendor-agnostic (NVIDIA / AMD / Intel). During `setup`, every GPU **except the host's
+primary (boot_vga) one** is bound to `vfio-pci`; a reboot is required after initial setup. On a
+multi-GPU host each GPU can be dedicated to a different VM, or several GPUs to one VM
+(`--gpu 2,3`). Use `gpu-list` to see which GPUs are free vs already assigned:
+
+```
+IDX  PCI          MODEL                    GROUP  DRIVER      STATE        ASSIGNED
+0    01:00.0      NVIDIA RTX 4090          14     vfio-pci    vfio-ready   free
+1    02:00.0      NVIDIA RTX 4090          15     vfio-pci    vfio-ready   llm-vm
+2    00:02.0      Intel UHD Graphics       0      i915        primary      free
+```
+
+> **Note:** GPU passthrough works best with the `q35` machine type (the default for `--gpu` creates).
+> The guest NVIDIA driver + CUDA toolkit is installed automatically by `vm-post-setup.sh` when the
+> passthrough GPU is NVIDIA; AMD/Intel guest drivers must be installed manually. Two *identical-model*
+> GPUs share one PCI ID and cannot be split (one host / one VM) by `setup` alone.
 
 #### Provisioning
 
@@ -152,9 +172,11 @@ sudo ./kvm-manager.sh rollback sandbox clean
 **GPU passthrough for LLM workloads:**
 
 ```bash
-sudo ./kvm-manager.sh setup                  # configures IOMMU + VFIO (reboot after)
-sudo ./kvm-manager.sh gpu-status             # verify GPU is bound to vfio-pci
-sudo ./kvm-manager.sh create llm-vm --cloud-image --cpu 8 --ram 32G --disk 100G --gpu --post-setup
+sudo ./kvm-manager.sh setup                  # binds non-primary GPUs to VFIO (reboot after)
+sudo ./kvm-manager.sh gpu-list               # see which GPUs are free vs assigned
+sudo ./kvm-manager.sh create llm-vm --cloud-image --cpu 8 --ram 32G --disk 100G --gpu 0 --post-setup
+# multi-GPU: dedicate different GPUs to different VMs
+sudo ./kvm-manager.sh create vm-b --cloud-image --ram 32G --gpu 2,3
 ```
 
 **Template-based workflow:**
@@ -411,7 +433,7 @@ The script is idempotent — it can be re-run safely. A marker file (`/opt/.post
 | **9. earlyoom** | Userspace OOM killer | Replaces `systemd-oomd`. Triggers at 5% free RAM, kills dev/build processes first, protects sshd/nginx/redis |
 | **10. sysctl tuning** | Kernel optimizations | SYN flood protection, TCP BBR congestion control, connection tuning, inotify limits, swap minimization, martian packet logging |
 | **11. MOTD** | Login banner | Cybersecurity-themed terminal banner with live system stats (memory, disk, network, security threat level) |
-| **12. NVIDIA GPU + CUDA** | GPU driver (conditional) | Only runs if an NVIDIA GPU is detected (including passthrough). Installs driver + CUDA toolkit + adds to PATH |
+| **12. NVIDIA GPU + CUDA** | GPU driver (conditional) | Only runs for an **NVIDIA** GPU — detected via `lspci` or a passthrough marker with `GPU_VENDOR=nvidia`. Installs driver + CUDA toolkit + adds to PATH. AMD/Intel passthrough GPUs are skipped (install vendor drivers manually) |
 
 ### Shell Aliases After Setup
 

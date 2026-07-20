@@ -996,9 +996,12 @@ phase "Phase 12/12: Checking for NVIDIA GPU..."
 GPU_DETECTED=false
 if lspci -nn 2>/dev/null | grep -qi 'nvidia.*\(3d controller\|vga compatible\)'; then
     GPU_DETECTED=true
-elif [[ -f /opt/.gpu-passthrough ]]; then
+elif [[ -f /opt/.gpu-passthrough ]] && grep -qi '^GPU_VENDOR=nvidia' /opt/.gpu-passthrough; then
+    # Passthrough marker present AND vendor is NVIDIA — CUDA install only makes sense here.
     GPU_DETECTED=true
-    log "GPU detected via passthrough marker"
+    log "NVIDIA GPU detected via passthrough marker"
+elif [[ -f /opt/.gpu-passthrough ]]; then
+    log "Non-NVIDIA GPU passthrough marker found — skipping NVIDIA/CUDA install (install vendor driver manually)"
 fi
 
 GPU_SUMMARY=""
