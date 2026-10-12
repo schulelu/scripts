@@ -12,10 +12,12 @@ SCRIPT_VERSION="1.0.0"
 DEFAULT_CPU=2
 DEFAULT_RAM_MIB=2048
 DEFAULT_DISK_GB=20
-LIBVIRT_IMAGES="/var/lib/libvirt/images"
+# Overridable: big VMs belong on a big array, e.g. KVM_IMAGES=/home/kvm-images
+LIBVIRT_IMAGES="${KVM_IMAGES:-/var/lib/libvirt/images}"
 TEMPLATE_MARKER=".kvm-template"
 KVM_SSH_KEY="" # Set dynamically in main() via get_kvm_ssh_key_path
-CLOUD_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+# Overridable, e.g. KVM_CLOUD_IMAGE_URL=https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
+CLOUD_IMAGE_URL="${KVM_CLOUD_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
 DEFAULT_POST_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vm-post-setup.sh"
 
 # --- GPU Passthrough (VFIO) ---
