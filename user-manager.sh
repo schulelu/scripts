@@ -1131,7 +1131,12 @@ function cmd_sudo_add() {
     local c
     for c in "${cmds[@]+"${cmds[@]}"}"; do
         if [[ "$c" == "$canonical" ]]; then
-            log_msg INFO "Already granted to '$cap': $canonical"
+            if [[ "$allow_exec" != "$(cap_allow_exec "$file")" ]]; then
+                write_cap "$cap" "$allow_exec" "${cmds[@]}"
+                log_msg WARN "--allow-exec: NOEXEC is now off for '$cap'. Its commands may spawn children, including a shell."
+            else
+                log_msg INFO "Already granted to '$cap': $canonical"
+            fi
             return 0
         fi
     done
