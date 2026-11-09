@@ -73,6 +73,12 @@ check "--allow-exec drops it" "0" \
 # Ubuntu builds sudo with --with-timeout=15; without this the password is asked
 # once per 15 minutes, which defeats its purpose here.
 check "cache disabled"        "1" "$(grep -c 'timestamp_timeout=0' <<<"$one" | tr -d ' ')"
+check "UM_SUDO_TIMEOUT sets the cache" "1" \
+      "$(grep -c '^Defaults:%sudogrp-demo timestamp_timeout=30$' <<<"$(SUDO_TIMEOUT=30 render_cap_file demo false '/usr/bin/true --flag')")"
+printf '%s\n' "$(SUDO_TIMEOUT=30 render_cap_file demo false '/usr/bin/true --flag')" > /tmp/.um_test_t30
+check "timeout parses back"   "30" "$(cap_timeout /tmp/.um_test_t30)"
+check "no file: timeout 0"    "0"  "$(cap_timeout /nonexistent)"
+rm -f /tmp/.um_test_t30
 check "never NOPASSWD"        "0" "$(grep -c 'NOPASSWD' <<<"$one" | tr -d ' ')"
 check "allow-exec still asks for password" "1" \
       "$(grep -c 'ALL=(root) PASSWD:' <<<"$(render_cap_file demo true '/usr/bin/true --flag')" | tr -d ' ')"
@@ -131,6 +137,28 @@ out="$( (check_root() { :; }; cmd_key root /dev/null) 2>&1 )"
 check "key refuses root"         "1" "$(grep -c 'is not in group' <<< "$out")"
 out="$( (check_root() { :; }; cmd_setup --bogus) 2>&1 )"
 check "setup rejects unknown flag" "1" "$(grep -c 'Unknown option' <<< "$out")"
+
+# --- ~/sudo-password.txt ---
+note="$(render_password_note s1.cvlibs.net 'Pw/x+1=')"
+check "password note holds the password"     "1" "$(grep -c '^    Pw/x+1=$' <<< "$note")"
+check "password note names the host"         "1" "$(grep -c 'on s1.cvlibs.net' <<< "$note")"
+check "password note says to delete it"      "1" "$(grep -c 'rm ~/sudo-password.txt' <<< "$note")"
+
+# --- keys go in as the user (stubs: runuser runs as us, getent gives a temp home) ---
+akh="$(mktemp -d)"
+out="$( getent() { printf 'x:x:1:1::%s:/bin/sh\n' "$akh"; }; runuser() { shift 3; "$@"; }
+        append_key_as_user x "ssh-ed25519 AAAAone a"; echo "rc=$?"
+        append_key_as_user x "ssh-ed25519 AAAAone a"; echo "rc=$?"
+        append_key_as_user x "ssh-ed25519 AAAAtwo b"; echo "rc=$?" )"
+check "key: added, duplicate is exit 3"  $'rc=0\nrc=3\nrc=0' "$out"
+check "key: both lines, once each"       "2" "$(wc -l < "$akh/.ssh/authorized_keys" | tr -d ' ')"
+check "key: ~/.ssh 700, file 600"        "700 600" "$(stat -c '%a' "$akh/.ssh" "$akh/.ssh/authorized_keys" | xargs)"
+rm -rf "$akh"
+# An unknown user whose /home/<name> exists (this box's own home stands in).
+hn="$(basename "$HOME")"
+check "add refuses an existing home"     "1" \
+      "$( (check_root() { :; }; id() { return 1; }; getent() { return 1; }; validate_user_name() { :; }
+          cmd_add "$hn" --key x) 2>&1 | grep -c "/home/$hn already exists" )"
 
 echo "----"
 if [[ $fail -eq 0 ]]; then echo "ALL PASS"; else echo "FAILURES"; fi

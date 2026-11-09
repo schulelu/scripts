@@ -17,6 +17,9 @@ SCRIPT_VERSION="1.1.0"
 #   UM_SHARED_USER=shared-dev UM_SHARED_DIR=/home/shared-dev ./user-manager.sh setup
 SHARED_USER="${UM_SHARED_USER:-shared}"
 SHARED_DIR="${UM_SHARED_DIR:-/home/shared}"
+# Minutes one sudo password stays valid on a terminal, for capability members.
+# Unset: keep what the capability file has (0 for a new one: ask every call).
+SUDO_TIMEOUT="${UM_SUDO_TIMEOUT:-}"
 MANAGED_GROUP="sshusers"
 CAP_PREFIX="sudogrp-"
 ALIAS_PREFIX="SUDOGRP_"
@@ -36,7 +39,7 @@ BOLD=""
 RESET=""
 
 function color_init() {
-    if [ -t 1 ]; then
+    if [ -t 1 ] && tput setaf 1 >/dev/null 2>&1; then   # a TERM without colours (dumb, vt100, kitty unknown here) would end set -e scripts
         RED=$(tput setaf 1)
         GREEN=$(tput setaf 2)
         YELLOW=$(tput setaf 3)
@@ -193,7 +196,7 @@ function cap_exists_any() {
 # --- sudoers rendering / parsing ---
 
 function render_cap_file() {
-    # Pure function of (cap, commands, allow_exec). Deterministic: no timestamps,
+    # Pure function of (cap, commands, allow_exec, SUDO_TIMEOUT). Deterministic: no timestamps,
     # so an unchanged capability renders byte-identically and we skip the write.
     local cap="$1" allow_exec="$2"
     shift 2
@@ -232,8 +235,9 @@ function render_cap_file() {
 
     # Ubuntu builds sudo with --with-timeout=15, so one successful sudo buys 15
     # password-free minutes on that tty. The password exists precisely to gate
-    # these commands, so re-authenticate every time.
-    printf 'Defaults:%%%s timestamp_timeout=0\n' "$grp"
+    # these commands, so by default re-authenticate every time. The line binds
+    # the members for all their sudo calls, not only these commands.
+    printf 'Defaults:%%%s timestamp_timeout=%s\n' "$grp" "${SUDO_TIMEOUT:-0}"
     printf '\n'
     # PASSWD: is written explicitly even though it is the default, so a later
     # global "Defaults !authenticate" cannot silently disarm these grants.
@@ -262,6 +266,12 @@ function cap_allow_exec() {
     local file="$1"
     [[ -f "$file" ]] || { echo "false"; return 0; }
     if grep -q 'ALL=(root) NOEXEC:' -- "$file"; then echo "false"; else echo "true"; fi
+}
+
+function cap_timeout() {
+    local file="$1" t=""
+    [[ -f "$file" ]] && t="$(sed -n 's/^Defaults:%[^ ]* timestamp_timeout=\([0-9]*\)$/\1/p' "$file")"
+    echo "${t:-0}"
 }
 
 function sudoers_name_ok() {
@@ -594,6 +604,38 @@ function gen_password() {
     openssl rand -base64 18
 }
 
+function render_password_note() {
+    # render_password_note HOST PASSWORD (pure) — the text of ~/sudo-password.txt
+    printf 'Your sudo password on %s (user-manager.sh, %s):\n\n    %s\n\n' "$1" "$(date +%F)" "$2"
+    printf 'It is only for sudo; SSH stays key-only. Store it in your password\n'
+    printf 'manager, then delete this file:  rm ~/sudo-password.txt\n'
+}
+
+function write_password_file() {
+    # write_password_file USER PASSWORD — ~USER/sudo-password.txt, mode 600,
+    # for the first login. Written AS the user: root never writes through a
+    # path the user controls (a planted symlink only reaches the user's files).
+    local user="$1" home host
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    host="$(hostname -f 2>/dev/null || hostname)"
+    render_password_note "$host" "$2" \
+        | runuser -u "$user" -- sh -c 'umask 077; rm -f -- "$1" && cat > "$1"' sh "$home/sudo-password.txt" \
+        || die "Could not write $home/sudo-password.txt"
+    log_msg INFO "Sudo password for '$user' is in $home/sudo-password.txt (user-only; they delete it after the first login)"
+}
+
+function append_key_as_user() {
+    # append_key_as_user USER KEYLINE — add KEYLINE to ~USER/.ssh/authorized_keys
+    # unless it is there (exit 3). Written AS the user, like write_password_file:
+    # the home is theirs, so a planted ~/.ssh or authorized_keys symlink would
+    # otherwise let root write (and chown) any file. umask 077: dir 700, file 600.
+    local home; home="$(getent passwd "$1" | cut -d: -f6)"
+    runuser -u "$1" -- sh -c 'umask 077
+        [ -d "$1" ] || mkdir "$1" || exit 1
+        [ -f "$2" ] && grep -qxF -- "$3" "$2" && exit 3
+        printf "%s\n" "$3" >> "$2"' sh "$home/.ssh" "$home/.ssh/authorized_keys" "$2"
+}
+
 function key_fingerprint() {
     local keyline="$1" tmp fp
     tmp="$(mktemp)"
@@ -705,12 +747,13 @@ function warn_if_root_equivalent() {
 
 function cmd_setup() {
     check_root
-    local do_hidepid=false service_account=false
+    local do_hidepid=false service_account=false fix_acls=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --hidepid)         do_hidepid=true; shift ;;
             --service-account) service_account=true; shift ;;
+            --fix-acls)        fix_acls=true; shift ;;
             *) die "Unknown option for setup: $1" ;;
         esac
     done
@@ -726,6 +769,9 @@ function cmd_setup() {
     fi
     # Ubuntu 24.04 socket-activates sshd.
     systemctl enable --now ssh.socket >/dev/null 2>&1 || systemctl enable --now ssh >/dev/null 2>&1 || true
+
+    local fresh_share=false
+    [[ -e "$SHARED_DIR" ]] || fresh_share=true
 
     log_msg PHASE "Creating managed group and shared account"
     groupadd -f "$MANAGED_GROUP"
@@ -759,11 +805,27 @@ function cmd_setup() {
     # setgid so new files inherit the share's group; 2770 (not 2775) keeps
     # non-members out entirely.
     chmod 2770 "$SHARED_DIR"
-    setfacl -R    -m "g:${SHARED_USER}:rwX" "$SHARED_DIR"
     # The DEFAULT ACL is the part that actually matters: UMASK is 022, so without
     # it every new file lands group-read-only and users cannot edit each other's
     # work. setgid alone fixes the group, not the write bit.
-    setfacl -R -d -m "g:${SHARED_USER}:rwX" "$SHARED_DIR"
+    # The tree is walked when this run created the share, or with --fix-acls
+    # (after files were moved in): inheritance covers everything created since,
+    # and a share can be millions of files. Never on a missing default entry
+    # alone: any member can remove it (setfacl -k as the share account) and so
+    # start a root walk through a tree they control. -execdir + setfacl -P: no
+    # symlink is followed, in the last component or above it.
+    # ~/.ssh stays the account's own: ssh refuses a key the group can read.
+    if [[ "$fresh_share" == "true" || "$fix_acls" == "true" ]]; then
+        log_msg INFO "Group ACL on everything below $SHARED_DIR (one walk; long on a big share)"
+        find "$SHARED_DIR" -mindepth 1 -path "$SHARED_DIR/.ssh" -prune \
+            -o -type d -execdir setfacl -P -m "g:${SHARED_USER}:rwX,d:g:${SHARED_USER}:rwX" {} + \
+            -o ! -type l -execdir setfacl -P -m "g:${SHARED_USER}:rwX" {} +
+    elif ! getfacl -cpd -- "$SHARED_DIR" 2>/dev/null | grep -q "^group:${SHARED_USER}:"; then
+        log_msg WARN "$SHARED_DIR had no default ACL for '$SHARED_USER' (removed by someone?) — set again on the top dir only; check the tree, then: setup --fix-acls"
+    else
+        log_msg INFO "$SHARED_DIR has its default ACL — tree not walked (--fix-acls forces it)"
+    fi
+    setfacl -P -m "g:${SHARED_USER}:rwX,d:g:${SHARED_USER}:rwX" "$SHARED_DIR"
     log_msg INFO "$SHARED_DIR is 2770 with a default ACL for group '$SHARED_USER'"
 
     log_msg PHASE "Hardening home directory permissions"
@@ -865,9 +927,9 @@ EOF
 
 function cmd_add() {
     check_root
-    [[ $# -ge 1 ]] || die "Usage: $SCRIPT_NAME.sh add <user> [--key-file F | --key 'S'] [--no-share]"
+    [[ $# -ge 1 ]] || die "Usage: $SCRIPT_NAME.sh add <user> [--key-file F | --key 'S'] [--no-share] [--password-file]"
     local user="$1"; shift
-    local key_file="" key_str="" share=true
+    local key_file="" key_str="" share=true pw_file=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -876,6 +938,8 @@ function cmd_add() {
             # For people who belong to another project on the same host: the
             # share holds that project's data and must stay closed to them.
             --no-share) share=false; shift ;;
+            # The password goes into ~user/sudo-password.txt instead of this terminal.
+            --password-file) pw_file=true; shift ;;
             *) die "Unknown option for add: $1" ;;
         esac
     done
@@ -883,6 +947,9 @@ function cmd_add() {
     validate_user_name "$user"
     id -u "$user" >/dev/null 2>&1 && die "User '$user' already exists"
     getent group "$user" >/dev/null 2>&1 && die "Group '$user' already exists"
+    # useradd -m reuses an existing home as it is, with whatever an earlier
+    # owner (or a reused uid) left in it.
+    [[ -e "/home/$user" || -L "/home/$user" ]] && die "/home/$user already exists — move it away first"
     getent group "$MANAGED_GROUP" >/dev/null 2>&1 || die "Run '$SCRIPT_NAME.sh setup' first"
     id -u "$SHARED_USER" >/dev/null 2>&1 || die "Run '$SCRIPT_NAME.sh setup' first"
 
@@ -901,10 +968,7 @@ function cmd_add() {
     printf '%s:%s\n' "$user" "$pw" | chpasswd
 
     chmod 700 "/home/$user"
-    install -d -m 700 -o "$user" -g "$user" "/home/$user/.ssh"
-    printf '%s\n' "$keyline" > "/home/$user/.ssh/authorized_keys"
-    chmod 600 "/home/$user/.ssh/authorized_keys"
-    chown "$user:$user" "/home/$user/.ssh/authorized_keys"
+    append_key_as_user "$user" "$keyline" || die "Could not write the key for '$user'"
 
     # No chroot means no bind mount: a plain symlink is enough, and userdel -r
     # will remove the link rather than the shared data behind it.
@@ -912,6 +976,7 @@ function cmd_add() {
         ln -sfn "$SHARED_DIR" "/home/$user/$SHARED_USER"
         chown -h "$user:$user" "/home/$user/$SHARED_USER"
     fi
+    if [[ "$pw_file" == "true" ]]; then write_password_file "$user" "$pw"; pw="in /home/$user/sudo-password.txt"; fi
 
     local host; host="$(hostname -f 2>/dev/null || hostname)"
     echo
@@ -924,7 +989,7 @@ function cmd_add() {
     [[ "$share" == "true" ]] && echo "  Shared dir:  /home/${user}/${SHARED_USER}  ->  ${SHARED_DIR}"
     echo "  Groups:      $(id -nG "$user")"
     echo
-    echo "  ${YELLOW}The password is shown once and is NOT used for SSH — it only"
+    echo "  ${YELLOW}The password is NOT used for SSH (shown once, or in the file) — it only"
     echo "  authenticates this user's sudo calls.${RESET}"
     echo "${BOLD}${CYAN}════════════════════════════════════════════════════════════${RESET}"
 }
@@ -968,7 +1033,7 @@ function cmd_delete() {
 
 function cmd_passwd() {
     check_root
-    [[ $# -eq 1 ]] || die "Usage: $SCRIPT_NAME.sh passwd <user>"
+    [[ $# -eq 1 || ( $# -eq 2 && "$2" == --password-file ) ]] || die "Usage: $SCRIPT_NAME.sh passwd <user> [--password-file]"
     local user="$1"
     id -u "$user" >/dev/null 2>&1 || die "No such user: '$user'"
     # Same boundary as delete: this tool resets passwords of accounts it
@@ -976,6 +1041,7 @@ function cmd_passwd() {
     is_managed_user "$user" || die "'$user' is not in group '$MANAGED_GROUP' — this script did not create it, refusing"
     local pw; pw="$(gen_password)"
     printf '%s:%s\n' "$user" "$pw" | chpasswd
+    if [[ "${2:-}" == --password-file ]]; then write_password_file "$user" "$pw"; return 0; fi
     log_msg INFO "New sudo password for '$user': ${BOLD}${pw}${RESET}   (shown once)"
 }
 
@@ -989,14 +1055,16 @@ function cmd_key() {
     local ak; ak="$(getent passwd "$user" | cut -d: -f6)/.ssh/authorized_keys"
 
     if [[ $# -eq 0 ]]; then
-        [[ -f "$ak" ]] || { log_msg INFO "No keys for '$user'"; return 0; }
+        # Read as the user: a symlinked authorized_keys must not show root's files.
+        local keys
+        keys="$(runuser -u "$user" -- cat -- "$ak" 2>/dev/null)" || { log_msg INFO "No keys for '$user'"; return 0; }
         log_msg INFO "Keys for '$user':"
         local n=0 line
         while read -r line; do
             [[ -z "$line" || "$line" == \#* ]] && continue
             n=$((n + 1))
-            echo "    $n. $(key_fingerprint "$line" 2>/dev/null || echo "unparseable: $line")"
-        done < "$ak"
+            echo "    $n. $(key_fingerprint "$line" 2>/dev/null || echo "unparseable line")"
+        done <<< "$keys"
         return 0
     fi
 
@@ -1008,15 +1076,13 @@ function cmd_key() {
     fi
     fp="$(validate_pubkey "$keyline")"
 
-    install -d -m 700 -o "$user" -g "$user" "$(dirname "$ak")"
-    if [[ -f "$ak" ]] && grep -qxF "$keyline" "$ak"; then
-        log_msg INFO "Key already present for '$user'"
-        return 0
-    fi
-    printf '%s\n' "$keyline" >> "$ak"
-    chmod 600 "$ak"
-    chown "$user:$user" "$ak"
-    log_msg INFO "Added key to '$user': $fp"
+    local rc=0
+    append_key_as_user "$user" "$keyline" || rc=$?
+    case "$rc" in
+        0) log_msg INFO "Added key to '$user': $fp" ;;
+        3) log_msg INFO "Key already present for '$user'" ;;
+        *) die "Could not write the key for '$user'" ;;
+    esac
 }
 
 function cmd_list() {
@@ -1039,9 +1105,8 @@ function cmd_list() {
         [[ -z "$u" ]] && continue
         caps="$(user_caps "$u" | tr '\n' ',' | sed 's/,$//')"
         ak="$(getent passwd "$u" | cut -d: -f6)/.ssh/authorized_keys"
-        nkeys=0
-        [[ -f "$ak" ]] && nkeys="$(grep -cvE '^\s*(#|$)' "$ak" || true)"
-        printf '%-16s %-30s %s\n' "$u" "${caps:--}" "$nkeys"
+        nkeys="$(runuser -u "$u" -- grep -cvE '^\s*(#|$)' -- "$ak" 2>/dev/null || true)"   # as the user, as in cmd_key
+        printf '%-16s %-30s %s\n' "$u" "${caps:--}" "${nkeys:-0}"
     done < <(list_managed_users)
 
     echo
@@ -1070,8 +1135,10 @@ function cmd_list() {
 function write_cap() {
     local cap="$1" allow_exec="$2"
     shift 2
-    local content
-    content="$(render_cap_file "$cap" "$allow_exec" "$@")"
+    local content timeout="${SUDO_TIMEOUT:-$(cap_timeout "$(cap_file "$cap")")}"
+    # Whole minutes: sudo reads a negative timeout as "never expires".
+    [[ "$timeout" =~ ^[0-9]{1,4}$ ]] || die "UM_SUDO_TIMEOUT must be whole minutes (0 = ask every call), got '$timeout'"
+    content="$(SUDO_TIMEOUT="$timeout" render_cap_file "$cap" "$allow_exec" "$@")"
     sudoers_install "$(cap_file "$cap")" "$content"
 }
 
@@ -1131,8 +1198,11 @@ function cmd_sudo_add() {
     local c
     for c in "${cmds[@]+"${cmds[@]}"}"; do
         if [[ "$c" == "$canonical" ]]; then
-            if [[ "$allow_exec" != "$(cap_allow_exec "$file")" ]]; then
-                write_cap "$cap" "$allow_exec" "${cmds[@]}"
+            local was_exec; was_exec="$(cap_allow_exec "$file")"
+            # Rewritten anyway, so a re-run brings the file up to the current
+            # render (UM_SUDO_TIMEOUT, format); unchanged content is not written.
+            write_cap "$cap" "$allow_exec" "${cmds[@]}"
+            if [[ "$allow_exec" != "$was_exec" ]]; then
                 log_msg WARN "--allow-exec: NOEXEC is now off for '$cap'. Its commands may spawn children, including a shell."
             else
                 log_msg INFO "Already granted to '$cap': $canonical"
@@ -1227,8 +1297,8 @@ function cmd_sudo_grant() {
 
 function cmd_sudo_revoke() {
     check_root
-    [[ $# -eq 2 ]] || die "Usage: $SCRIPT_NAME.sh sudo-revoke <capability> <user>"
-    local cap="$1" user="$2"
+    [[ $# -eq 2 || ( $# -eq 3 && "$3" == --keep-sessions ) ]] || die "Usage: $SCRIPT_NAME.sh sudo-revoke <capability> <user> [--keep-sessions]"
+    local cap="$1" user="$2" keep="${3:-}"
     validate_cap_name "$cap"
     id -u "$user" >/dev/null 2>&1 || die "No such user: '$user'"
     local grp; grp="$(cap_group "$cap")"
@@ -1244,6 +1314,9 @@ function cmd_sudo_revoke() {
     # Revocation does not reach live sessions either: the group is still in the
     # kernel group vector of any already-running login shell.
     log_msg WARN "Existing sessions of '$user' KEEP this capability until they exit."
+    # --keep-sessions: a sync that revokes one of several rights (bootstrap.sh
+    # grant_members) must not end the person's work, even under UM_ASSUME_YES.
+    [[ "$keep" == --keep-sessions ]] && return 0
     if confirm "Terminate all sessions of '$user' now?"; then
         loginctl terminate-user "$user" 2>/dev/null || pkill -u "$user" 2>/dev/null || true
         log_msg INFO "Sessions of '$user' terminated"
@@ -1284,23 +1357,30 @@ ${BOLD}USAGE${RESET}
     sudo ./$SCRIPT_NAME.sh <command> [args]
 
 ${BOLD}SETUP${RESET}
-    setup [--hidepid] [--service-account]
+    setup [--hidepid] [--service-account] [--fix-acls]
                                 Install sshd, create the '$SHARED_USER' account and
                                 shared workspace, harden home permissions, write
                                 the sshd drop-in. --hidepid also hides other
                                 users' processes (may upset desktop tooling).
                                 --service-account makes '$SHARED_USER' a no-login
                                 system account (for shares that services run from).
+                                The group ACL goes onto every file below the share
+                                once; later runs only fix the top dir. --fix-acls
+                                walks the tree again (after files were moved in).
                                 Another share: UM_SHARED_USER=x UM_SHARED_DIR=/home/x
     harden-ssh                  Disable password SSH for ALL accounts (asks first).
 
 ${BOLD}USERS${RESET}
-    add <user> [--key-file F|--key 'S'] [--no-share]
+    add <user> [--key-file F|--key 'S'] [--no-share] [--password-file]
                                 Create a user from a public key. Generates a
-                                random password, prints it once. --no-share keeps
+                                random password, prints it once (--password-file:
+                                into ~user/sudo-password.txt). --no-share keeps
                                 them out of '$SHARED_USER'.
     delete <user> [--purge]     Remove a user. --purge also removes their home.
-    passwd <user>               Generate and print a new sudo password.
+    passwd <user> [--password-file]
+                                Generate a new sudo password: printed once, or with
+                                --password-file written to ~user/sudo-password.txt
+                                (user-only), for the user to read at first login.
     key <user> [<keyfile>|-]    List keys, or append one ('-' reads a paste).
     list [user]                 Show managed users, capabilities and grants.
 
@@ -1312,13 +1392,17 @@ ${BOLD}SUDO CAPABILITIES${RESET}
     sudo-del <cap> ['<abs-path args>']
                                 Revoke one command, or delete <cap> entirely.
     sudo-grant  <cap> <user>    Give a user the capability.
-    sudo-revoke <cap> <user>    Take it away.
+    sudo-revoke <cap> <user> [--keep-sessions]
+                                Take it away (and offer to end their sessions).
     verify <user> [-- cmd args] Ask sudo whether the user may run something.
 
 ${BOLD}HOW SUDO GRANTS WORK${RESET}
     One Unix group per capability (${CAP_PREFIX}<cap>), one file per capability in
-    $SUDOERS_D. Grants always require the user's password — never NOPASSWD,
-    and the credential cache is disabled, so every call re-authenticates.
+    $SUDOERS_D. Grants always require the user's password — never NOPASSWD.
+    The credential cache is off (every call re-authenticates) unless
+    UM_SUDO_TIMEOUT=<minutes> is set on sudo-add; that value then holds for the
+    capability's members on all their sudo calls, per terminal. A later run
+    without UM_SUDO_TIMEOUT keeps the value the file has.
 
     ${BOLD}Arguments are matched exactly.${RESET} '/usr/sbin/nginx -t' permits only that
     invocation, not 'nginx -q -t'. Add each accepted form separately; do not

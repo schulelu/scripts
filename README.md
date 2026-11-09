@@ -569,7 +569,7 @@ sudo ./user-manager.sh verify alice -- /usr/sbin/nginx -t
 #### Setup
 
 ```
-setup [--hidepid] [--service-account]
+setup [--hidepid] [--service-account] [--fix-acls]
                               Install sshd, create the shared account and
                               workspace, harden home permissions, write the
                               sshd drop-in
@@ -595,7 +595,7 @@ sudo-add <cap> '<abs-path args>' [--force] [--allow-exec]
 sudo-del <cap> ['<abs-path args>']
                               Revoke one command, or delete the capability
 sudo-grant  <cap> <user>      Give a user the capability
-sudo-revoke <cap> <user>      Take it away
+sudo-revoke <cap> <user> [--keep-sessions]   Take it away; offers to end their sessions unless --keep-sessions
 verify <user> [-- cmd args]   Ask sudo whether the user may run something
 ```
 
@@ -611,6 +611,9 @@ verify <user> [-- cmd args]   Ask sudo whether the user may run something
                     (no password, no keys, no dotfiles) — for shares that
                     services run from, where a login would let any member plant
                     a .bashrc that runs as the service
+--fix-acls          setup: put the share's group ACL on every file below it
+                    again. Without it, only the first setup walks the tree
+                    (later runs fix the top dir; inheritance covers new files)
 --no-share          add: keep the user out of the shared group (someone from
                     another project on the same host)
 --force             sudo-add: grant a bare path (ANY arguments), or skip the
